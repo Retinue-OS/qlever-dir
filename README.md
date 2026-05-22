@@ -116,18 +116,24 @@ Each rebuild cycle:
 
 ## Rebuild scheduling
 
-- **Bounded delay**: the first filesystem change schedules a rebuild
-  `REBUILD_DELAY` seconds in the future. Further changes during that window
-  are noted but do **not** push back the deadline. This guarantees a rebuild
-  starts at most `REBUILD_DELAY` seconds after the first change, even on a
-  directory that is continuously being written to (no starvation).
-- **No parallel rebuilds**: while a rebuild is running, additional changes
-  set a `change_pending` flag. Only **one** rebuild is queued — multiple
-  changes during a rebuild collapse to a single follow-up rebuild.
-- **Back-to-back**: when a rebuild finishes and `change_pending` is set, the
-  next rebuild starts immediately (without re-debouncing). On a directory
-  that's constantly being written to, you'll see a continuous rebuild loop,
-  but never two rebuilds in parallel.
+A change to a file in `/data` triggers a rebuild according to these rules:
+
+- **No rebuild currently running**: the first change schedules a rebuild
+  exactly `REBUILD_DELAY` seconds in the future. Further changes during that
+  window are noted but do **not** push back the deadline. So when the system
+  is idle, a rebuild starts at most `REBUILD_DELAY` seconds after the change.
+- **A rebuild is currently running** (which can take seconds, minutes, or
+  hours depending on data volume): additional changes set a `change_pending`
+  flag. Multiple changes collapse to a single queued rebuild — never more
+  than one is queued at a time.
+- **When the current rebuild finishes** and `change_pending` is set, the
+  next rebuild starts immediately, without re-debouncing.
+
+So the overall guarantee is: a change triggers a rebuild **either** at most
+`REBUILD_DELAY` seconds later (if the system was idle), **or** immediately
+after the currently running rebuild finishes. Two rebuilds never run in
+parallel. On a directory under continuous write load, you'll see a
+back-to-back rebuild loop with no idle gaps.
 
 ## Filesystem watching limitations
 
