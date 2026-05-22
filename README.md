@@ -96,10 +96,11 @@ Each rebuild cycle:
 
 ## Rebuild scheduling
 
-- **Debounce**: a filesystem change starts a `REBUILD_DELAY`-second timer.
-  Further changes during that window reset the timer. Only after the window
-  is quiet does the rebuild start. This coalesces bursts of changes (large
-  `cp -r`, `git pull`, batch ingestion).
+- **Bounded delay**: the first filesystem change schedules a rebuild
+  `REBUILD_DELAY` seconds in the future. Further changes during that window
+  are noted but do **not** push back the deadline. This guarantees a rebuild
+  starts at most `REBUILD_DELAY` seconds after the first change, even on a
+  directory that is continuously being written to (no starvation).
 - **No parallel rebuilds**: while a rebuild is running, additional changes
   set a `change_pending` flag. Only **one** rebuild is queued — multiple
   changes during a rebuild collapse to a single follow-up rebuild.

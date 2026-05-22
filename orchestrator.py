@@ -9,7 +9,11 @@ Slots:
 nginx on port 7001 proxies to the active slot.
 
 State machine:
-  IDLE      -> watching; any FS change starts the debounce timer
+  IDLE      -> watching; the first FS change schedules a rebuild
+               REBUILD_DELAY seconds in the future. Further changes during
+               that window do not push back the deadline — this guarantees
+               a rebuild starts at most REBUILD_DELAY seconds after the
+               first change, even on a continuously changing directory.
   BUILDING  -> rebuild running; further changes set change_pending=True
 
 After a build completes in BUILDING state:
@@ -271,8 +275,9 @@ def main():
         nonlocal debounce_deadline, change_pending
         with state_lock:
             if state == "IDLE":
-                debounce_deadline = time.time() + REBUILD_DELAY
-                log(f"Debounce timer set: rebuild in {REBUILD_DELAY}s")
+                if debounce_deadline is None:
+                    debounce_deadline = time.time() + REBUILD_DELAY
+                    log(f"Rebuild scheduled in {REBUILD_DELAY}s")
             else:
                 change_pending = True
                 log("Change detected during build: queuing one more rebuild")
