@@ -9,18 +9,23 @@
 #
 # e.g. /data/health/obs.nt -> <https://example.org/data/health/obs.nt>
 #
-# The combined N-Quads stream is piped into qlever-index. The index files are
-# written into <index_dir> with the basename "rdf-store".
+# If a file fails to parse, instead of its (partial) triples we emit one
+# diagnostic quad describing the failure:
+#
+#   <graph> <urn:qlever-dir:parsingError> "stderr message" <graph> .
+#
+# The build itself still succeeds — broken files surface as queryable
+# annotations rather than blocking the whole store update.
 
 set -euo pipefail
 
 INDEX_DIR="${1:?Usage: build_index.sh <index_dir>}"
 BASE_URI="${BASE_URI:-https://example.org/data/}"
 INDEX_NAME="rdf-store"
+ERROR_PREDICATE="urn:qlever-dir:parsingError"
 
 log() { echo "[build_index] $*" >&2; }
 
-# Clean any previous index in this slot so the new build is from scratch.
 mkdir -p "${INDEX_DIR}"
 find "${INDEX_DIR}" -mindepth 1 -delete
 
@@ -35,6 +40,17 @@ mapfile -d '' RDF_FILES < <(
     | sort -z
 )
 
+# Escape a string for use inside an N-Triples/N-Quads literal:
+#   backslash -> \\, double-quote -> \", newlines/tabs -> single space
+escape_literal() {
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t' '  '
+}
+
+# Track parse failures across the pipeline subshell via a shared file
+# (the for-loop runs in a subshell because of the pipe to qlever-index).
+ERRORS_FILE=$(mktemp)
+trap 'rm -f "${ERRORS_FILE}"' EXIT
+
 stream_as_nquads() {
     local filepath="$1"
     local relpath="${filepath#/data/}"
@@ -48,10 +64,24 @@ stream_as_nquads() {
         *)   log "Skipping unknown extension: ${filepath}"; return 0 ;;
     esac
 
-    # rapper outputs canonical N-Triples: '<s> <p> <o> .' per line.
-    # Replace the trailing ' .' with ' <graph> .' to form an N-Quad.
-    rapper -q -i "${format}" -o ntriples "${filepath}" \
-        | sed "s| \\.\$| <${graph_iri}> .|"
+    local stdout_file stderr_file
+    stdout_file=$(mktemp)
+    stderr_file=$(mktemp)
+
+    if rapper -q -i "${format}" -o ntriples "${filepath}" \
+            > "${stdout_file}" 2> "${stderr_file}"; then
+        sed "s| \\.\$| <${graph_iri}> .|" "${stdout_file}"
+    else
+        local error_msg
+        error_msg=$(escape_literal < "${stderr_file}")
+        [[ -z "${error_msg}" ]] && error_msg="rapper exited non-zero with no stderr output"
+        log "PARSE ERROR ${filepath}: ${error_msg}"
+        printf '<%s> <%s> "%s" <%s> .\n' \
+            "${graph_iri}" "${ERROR_PREDICATE}" "${error_msg}" "${graph_iri}"
+        echo "${filepath}" >> "${ERRORS_FILE}"
+    fi
+
+    rm -f "${stdout_file}" "${stderr_file}"
 }
 
 if [[ ${#RDF_FILES[@]} -eq 0 ]]; then
@@ -85,4 +115,6 @@ log "Streaming as N-Quads into qlever-index ..."
     -F nq \
     -f -
 
-log "Index build complete in ${INDEX_DIR}"
+ERROR_COUNT=$(wc -l < "${ERRORS_FILE}" | tr -d ' ')
+OK_COUNT=$(( ${#RDF_FILES[@]} - ERROR_COUNT ))
+log "Index build complete in ${INDEX_DIR} — ok=${OK_COUNT} errors=${ERROR_COUNT}"

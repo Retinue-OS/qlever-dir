@@ -79,6 +79,26 @@ services:
 All formats are normalized through `rapper` (from `raptor2-utils`) so prefix
 declarations, escaped strings, etc. are handled correctly.
 
+## Parse errors are visible through the SPARQL endpoint
+
+If a file fails to parse, the build does not abort. Instead of that file's
+triples, the index gets a single diagnostic quad in the file's named graph:
+
+```
+<{graph_iri}> <urn:qlever-dir:parsingError> "{stderr message}" <{graph_iri}> .
+```
+
+You can list all currently broken files via SPARQL:
+
+```sparql
+SELECT ?file ?error WHERE {
+  ?file <urn:qlever-dir:parsingError> ?error
+}
+```
+
+Once a file is fixed and saved, the next rebuild replaces the error quad with
+the actual triples.
+
 ## Blue-green rebuild details
 
 - **Slot A**: index at `/index-a`, QLever on port 7101
