@@ -1,0 +1,11 @@
+services:
+  sparql:
+    build: .
+    ports:
+      - "7001:7001"
+    volumes:
+      - ./my-data:/data:ro
+    environment:
+      BASE_URI: https://example.org/data/
+      REBUILD_DELAY: "15"
+    restart: unless-stopped
