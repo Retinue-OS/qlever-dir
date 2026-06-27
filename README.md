@@ -79,6 +79,52 @@ services:
 All formats are normalized through `rapper` (from `raptor2-utils`) so prefix
 declarations, escaped strings, etc. are handled correctly.
 
+## Converters for non-RDF files
+
+Files that are not RDF (Markdown, CSV, …) can also be indexed by declaring a
+**converter** for their extension. The container itself stays domain-agnostic:
+converters live in the mounted data directory, not in the image.
+
+Place a `.qlever/converters.json` next to the files it should handle:
+
+```
+projects/
+  .qlever/
+    converters.json      ← { "md": "md2ttl.py" }
+    md2ttl.py            ← executable converter
+  rollstuhl-bluetooth.md
+  steuererklaerung-2026.md
+```
+
+`converters.json` maps a file extension to an executable command. The command is
+resolved relative to the `.qlever/` directory (an absolute path is used as-is)
+and invoked as:
+
+```
+<command> <input-file>
+```
+
+It must **emit Turtle on stdout**. The output is then normalized through
+`rapper` and tagged with the source file's own path-derived graph IRI — so a
+converted `projects/foo.md` yields triples in graph
+`<{BASE_URI}projects/foo.md>`, keeping provenance on the source file. A
+converter that **exits non-zero** produces a queryable `parsingError` quad
+(see below) instead of aborting the build, exactly like an RDF parse failure.
+
+**Nearest config wins (cascading).** For each file, the converter is taken from
+the closest `.qlever/converters.json` found walking up to `/data`. A `.qlever/`
+therefore configures its own directory *and* everything beneath it, and a deeper
+`.qlever/` overrides a shallower one. No separate recursive/non-recursive
+setting is needed — placing the config controls the scope.
+
+A worked example (the project schema above, with a dependency-free stdlib
+converter) is in [`examples/projects/`](examples/projects).
+
+> **Trust note:** when a `.qlever/converters.json` is present, qlever-dir
+> executes the referenced program from the mounted data directory on every
+> rebuild. Only mount data you trust to also run its converters. Without any
+> `converters.json`, behaviour is unchanged — only `.nt`/`.ttl`/`.n3` are read.
+
 ## Parse errors are visible through the SPARQL endpoint
 
 If a file fails to parse, the build does not abort. Instead of that file's
@@ -152,8 +198,10 @@ implemented).
   rapper, Python.
 - `orchestrator.py` — entrypoint. Manages the state machine, inotify watcher,
   blue-green swap, and nginx reloads.
-- `build_index.sh` — converts triple files to N-Quads and feeds them to
-  `qlever-index`.
+- `build_index.sh` — converts triple files (and non-RDF files via declared
+  converters) to N-Quads and feeds them to `qlever-index`.
+- `examples/projects/` — a worked converter example: project Markdown files with
+  a `.qlever/converters.json` and a dependency-free Markdown→Turtle converter.
 - `nginx.conf` — proxies port 7001 to the active QLever slot. Includes the
   dynamic upstream file `/run/nginx-upstream.conf`.
 - `docker-compose.yml` — minimal usage example.
