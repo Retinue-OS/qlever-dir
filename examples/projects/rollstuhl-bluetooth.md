@@ -12,7 +12,8 @@ paused: false
 category: technology
 links:
   - gmail:abc123
-  - file:/Drive/Rollstuhl/Bluetooth/log-2026-06-20.pcapng
+  - file:/data/captures/wheelchair-ble-2026-06-20.pcapng
+  - manufacturer support ticket #4711
 ---
 
 # Understand wheelchair Bluetooth protocol
@@ -29,3 +30,7 @@ The wheelchair control protocol is documented and reproducibly tested.
 This Markdown file is the canonical, hand-editable source. The frontmatter above
 is converted to triples by `.qlever/md2ttl.py`; the prose in this body is left
 to a separate, on-demand extraction step.
+
+The three `links:` entries cover all the converter's cases: a custom URI scheme,
+a `file:` IRI, and — in the third — a value with no scheme at all, which is
+emitted as a plain literal rather than an IRI.

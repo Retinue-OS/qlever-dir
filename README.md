@@ -93,7 +93,7 @@ projects/
     converters.json      ← { "md": "md2ttl.py" }
     md2ttl.py            ← executable converter
   rollstuhl-bluetooth.md
-  steuererklaerung-2026.md
+  solar-panel-quote.md
 ```
 
 `converters.json` maps a file extension to an executable command. The command is
