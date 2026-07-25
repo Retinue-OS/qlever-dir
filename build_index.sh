@@ -24,6 +24,13 @@
 #
 # The build itself still succeeds — broken files surface as queryable
 # annotations rather than blocking the whole store update.
+#
+# Symlinks are scanned by dereferencing at the type-test step only (-xtype f),
+# not while walking directories, so a matching symlink is indexed like a
+# regular file but a symlinked directory is never descended into. A symlink
+# whose target is missing or is not a regular file cannot be indexed either
+# way, so it gets a diagnostic quad of its own instead of being silently
+# dropped from the scan.
 
 set -euo pipefail
 
@@ -68,10 +75,23 @@ for ext in "${CONVERTER_EXTS[@]}"; do
     [[ -n "${ext}" ]] && FIND_NAME_ARGS+=( -o -name "*.${ext}" )
 done
 
+# -P (physical, the default): never follow a symlink while descending into
+# directories, so a symlink to a directory is skipped rather than walked —
+# no double-visited files, no loop.
+# -xtype f: test the type of what a symlink points to, so a symlink to a
+# regular file is picked up like the file itself would be. For a non-symlink
+# entry -xtype behaves exactly like -type.
+FIND_BASE=( -P /data -not -path '*/.qlever/*' -not -path '*/.git/*' \( "${FIND_NAME_ARGS[@]}" \) )
+
 mapfile -d '' RDF_FILES < <(
-    find /data -type f -not -path '*/.qlever/*' -not -path '*/.git/*' \
-        \( "${FIND_NAME_ARGS[@]}" \) -print0 2>/dev/null \
-    | sort -z
+    find "${FIND_BASE[@]}" -xtype f -print0 2>/dev/null | sort -z
+)
+
+# Symlinks matching the name patterns whose target is missing or is not a
+# regular file (e.g. a directory) — -xtype f above does not match these, so
+# without this pass they would vanish from the scan with no diagnostic.
+mapfile -d '' BROKEN_SYMLINKS < <(
+    find "${FIND_BASE[@]}" -type l -not -xtype f -print0 2>/dev/null | sort -z
 )
 
 # Escape a string for use inside an N-Triples/N-Quads literal:
@@ -175,7 +195,29 @@ stream_as_nquads() {
     rm -f "${stdout_file}" "${stderr_file}" ${conv_out:+"${conv_out}"}
 }
 
-if [[ ${#RDF_FILES[@]} -eq 0 ]]; then
+# Emit a diagnostic quad for a symlink matched by name but unusable as a
+# source file — dangling (target does not exist, e.g. it points outside
+# /data, which is all this container has mounted) or pointing at something
+# that isn't a regular file. No parse/convert is attempted; the failure is
+# already known from the filesystem itself.
+stream_broken_symlink() {
+    local filepath="$1"
+    local relpath="${filepath#/data/}"
+    local graph_iri="${BASE_URI}${relpath}"
+    local target msg
+    target=$(readlink -- "${filepath}")
+    if [[ ! -e "${filepath}" ]]; then
+        msg="broken symlink, target does not exist: ${target}"
+    else
+        msg="symlink target is not a regular file: ${target}"
+    fi
+    log "SYMLINK ERROR ${filepath}: ${msg}"
+    printf '<%s> <%s> "%s" <%s> .\n' \
+        "${graph_iri}" "${ERROR_PREDICATE}" "$(printf '%s' "${msg}" | escape_literal)" "${graph_iri}"
+    echo "${filepath}" >> "${ERRORS_FILE}"
+}
+
+if [[ ${#RDF_FILES[@]} -eq 0 && ${#BROKEN_SYMLINKS[@]} -eq 0 ]]; then
     log "No .nt/.ttl/.n3 files found under /data — building empty index"
     PLACEHOLDER='<urn:qlever-dir:empty> <urn:qlever-dir:status> "empty" <urn:qlever-dir:meta> .'
     echo "${PLACEHOLDER}" | qlever-index \
@@ -192,12 +234,22 @@ log "Found ${#RDF_FILES[@]} file(s):"
 for f in "${RDF_FILES[@]}"; do
     log "  ${f}"
 done
+if [[ ${#BROKEN_SYMLINKS[@]} -gt 0 ]]; then
+    log "Found ${#BROKEN_SYMLINKS[@]} unusable symlink(s):"
+    for f in "${BROKEN_SYMLINKS[@]}"; do
+        log "  ${f}"
+    done
+fi
 
 log "Streaming as N-Quads into qlever-index ..."
 {
     for filepath in "${RDF_FILES[@]}"; do
         log "Processing: ${filepath}"
         stream_as_nquads "${filepath}"
+    done
+    for filepath in "${BROKEN_SYMLINKS[@]}"; do
+        log "Processing: ${filepath}"
+        stream_broken_symlink "${filepath}"
     done
 } | qlever-index \
     -i "${INDEX_NAME}" \
@@ -206,6 +258,7 @@ log "Streaming as N-Quads into qlever-index ..."
     -F nq \
     -f -
 
+TOTAL_COUNT=$(( ${#RDF_FILES[@]} + ${#BROKEN_SYMLINKS[@]} ))
 ERROR_COUNT=$(wc -l < "${ERRORS_FILE}" | tr -d ' ')
-OK_COUNT=$(( ${#RDF_FILES[@]} - ERROR_COUNT ))
+OK_COUNT=$(( TOTAL_COUNT - ERROR_COUNT ))
 log "Index build complete in ${INDEX_DIR} — ok=${OK_COUNT} errors=${ERROR_COUNT}"
