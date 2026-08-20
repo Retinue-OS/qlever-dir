@@ -5,7 +5,12 @@
 # into canonical N-Triples and converts every triple into a quad by appending
 # a graph IRI derived from the file path:
 #
-#   graph IRI = <BASE_URI><relative path from /data>
+#   graph IRI = <BASE_URI><percent-encoded relative path from /data>
+#
+# The relative path is percent-encoded (see urlencode_relpath) so that any
+# character a filename can legally contain — spaces, quotes, backslashes,
+# '&', '|', control characters, ... — yields a well-formed IRI instead of
+# corrupting or breaking it.
 #
 # e.g. /data/health/obs.nt -> <https://example.org/data/health/obs.nt>
 #
@@ -95,9 +100,32 @@ mapfile -d '' BROKEN_SYMLINKS < <(
 )
 
 # Escape a string for use inside an N-Triples/N-Quads literal:
-#   backslash -> \\, double-quote -> \", newlines/tabs -> single space
+#   backslash -> \\, double-quote -> \", any C0 control char (newline, tab,
+#   carriage return, ...) -> single space
 escape_literal() {
-    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t' '  '
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\000-\037' ' '
+}
+
+# Percent-encode a path (relative to /data) for safe use inside a graph IRI.
+# Letters, digits, and IRI-safe punctuation ("/-._~!$&'()*+,;=:@") pass
+# through unescaped; non-ASCII bytes also pass through raw (IRIs permit them
+# directly). Everything else — spaces, '<', '>', '"', '{', '}', '|', '^',
+# backtick, backslash, '%', C0 control characters, ... — is percent-encoded,
+# so the result is always a legal IRI component regardless of what odd bytes
+# a filename contains.
+urlencode_relpath() {
+    python3 - "$1" <<'PY'
+import sys
+s = sys.argv[1]
+safe = "/-._~!$&'()*+,;=:@"
+out = []
+for ch in s:
+    if ord(ch) > 127 or ch in safe or (ch.isalnum() and ord(ch) < 128):
+        out.append(ch)
+    else:
+        out.extend('%%%02X' % b for b in ch.encode('utf-8'))
+print(''.join(out))
+PY
 }
 
 # For a non-RDF file, resolve the converter command from the nearest ancestor
@@ -155,7 +183,7 @@ emit_error_quad() {
 stream_as_nquads() {
     local filepath="$1"
     local relpath="${filepath#/data/}"
-    local graph_iri="${BASE_URI}${relpath}"
+    local graph_iri="${BASE_URI}$(urlencode_relpath "${relpath}")"
     local format source conv_out=""
 
     local stdout_file stderr_file
@@ -187,7 +215,19 @@ stream_as_nquads() {
 
     if rapper -q -i "${format}" -o ntriples "${source}" \
             > "${stdout_file}" 2> "${stderr_file}"; then
-        sed "s| \\.\$| <${graph_iri}> .|" "${stdout_file}"
+        # Append the graph IRI by replacing the trailing " ." rapper's
+        # ntriples output always ends each line with. The IRI is passed to
+        # awk via ENVIRON (not -v, and not interpolated into the program
+        # text) so it is treated purely as data: no backslash-escape
+        # decoding and no '&'-means-matched-text sub()/gsub() replacement
+        # magic can corrupt it, however it or the filename it was derived
+        # from is spelled.
+        G="${graph_iri}" awk '{
+            line = $0
+            n = sub(/ \.$/, "", line)
+            if (n) print line " <" ENVIRON["G"] "> ."
+            else print $0
+        }' "${stdout_file}"
     else
         emit_error_quad "${graph_iri}" "${stderr_file}" "parse" "${filepath}"
     fi
@@ -203,7 +243,7 @@ stream_as_nquads() {
 stream_broken_symlink() {
     local filepath="$1"
     local relpath="${filepath#/data/}"
-    local graph_iri="${BASE_URI}${relpath}"
+    local graph_iri="${BASE_URI}$(urlencode_relpath "${relpath}")"
     local target msg
     target=$(readlink -- "${filepath}")
     if [[ ! -e "${filepath}" ]]; then
