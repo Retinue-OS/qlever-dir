@@ -64,7 +64,8 @@ def log(msg: str) -> None:
 
 
 def write_upstream(port: int) -> None:
-    """Write the nginx upstream config fragment and reload nginx."""
+    """Write the nginx upstream config fragment. Does NOT reload nginx —
+    call reload_nginx() separately for the new upstream to take effect."""
     content = f"upstream qlever_active {{ server 127.0.0.1:{port}; }}\n"
     Path(NGINX_UPSTREAM_FILE).write_text(content)
     log(f"Wrote nginx upstream -> 127.0.0.1:{port}")
@@ -80,7 +81,24 @@ def reload_nginx() -> None:
         log("nginx reloaded")
 
 
-def start_nginx() -> None:
+def read_nginx_pid() -> int | None:
+    """Read the nginx master PID from the pid file (nginx.conf sets
+    `pid /run/nginx.pid;`). Returns None if the file doesn't exist yet or
+    doesn't contain a valid pid."""
+    try:
+        return int(Path("/run/nginx.pid").read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def start_nginx() -> int:
+    """Start nginx and return its master PID.
+
+    `nginx` (without -g "daemon off;") daemonizes itself: subprocess.run()
+    only confirms the initial fork/exec succeeded, not that the master
+    process is still alive afterwards. We additionally wait for and read
+    back /run/nginx.pid so the caller has a real PID to supervise.
+    """
     result = subprocess.run(
         ["nginx", "-t"], capture_output=True, text=True
     )
@@ -88,7 +106,63 @@ def start_nginx() -> None:
         log(f"nginx config test failed: {result.stderr.strip()}")
         sys.exit(1)
     subprocess.run(["nginx"], check=True)
-    log("nginx started")
+    # The pid file is written asynchronously by the daemonizing master;
+    # give it a brief moment to appear.
+    pid = None
+    for _ in range(50):  # up to ~5s
+        pid = read_nginx_pid()
+        if pid is not None:
+            break
+        time.sleep(0.1)
+    if pid is None:
+        log("nginx started but /run/nginx.pid never appeared — cannot supervise it")
+        sys.exit(1)
+    log(f"nginx started (master pid={pid})")
+    return pid
+
+
+def nginx_is_alive(pid: int) -> bool:
+    """Check whether the nginx master process is still running.
+
+    We are PID 1 in this container, so a dead child is reparented to us
+    and lingers as a zombie (state "Z") until reaped — os.kill(pid, 0)
+    still succeeds on a zombie, so it can't tell "exited, not yet reaped"
+    apart from "still running". Instead we read /proc/<pid>/stat and look
+    at the process state field directly: a missing /proc entry or state
+    "Z" both mean nginx is effectively gone.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    # Format: "pid (comm) state ...". comm can contain spaces/parens, so
+    # split off everything after the *last* ')' to find the state field.
+    fields_after_comm = stat.rsplit(")", 1)[-1].split()
+    state = fields_after_comm[0] if fields_after_comm else ""
+    return state != "Z"
+
+
+def reap_zombies() -> None:
+    """Opportunistically reap exited children so PID 1 doesn't accumulate
+    zombies (any reparented grandchild becomes our direct child on exit).
+
+    This uses os.waitpid(-1, WNOHANG), which reaps whichever eligible
+    child happens to have exited — it is NOT restricted to a specific pid.
+    That means it must never run before active_proc.poll() has had a
+    chance to observe/reap its own child: subprocess.Popen tracks a
+    specific pid and gets confused if that pid is reaped out from under
+    it by someone else first. Callers must call this only *after* calling
+    .poll() on every Popen object they still care about in this same
+    iteration, never before.
+    """
+    try:
+        while True:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                break
+    except ChildProcessError:
+        # No children left to wait for.
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +294,13 @@ def do_rebuild(active_slot: str | None, active_proc: subprocess.Popen | None):
     log(f"Traffic swapped to slot={target_slot} port={target_port}")
 
     if active_proc is not None and active_slot is not None:
+        # Give nginx's old workers a moment to finish in-flight requests
+        # against the previous backend before we SIGTERM it — `nginx -s
+        # reload` starts new workers with the new upstream and tells old
+        # workers to shut down gracefully, but that handoff is not
+        # instantaneous, so stopping the old qlever-server immediately
+        # after reload_nginx() can race a request still in flight.
+        time.sleep(2)
         stop_qlever(active_proc, active_slot)
 
     log(f"Blue-green swap complete: active_slot={target_slot}")
@@ -310,7 +391,7 @@ def main():
 
     Path("/run").mkdir(parents=True, exist_ok=True)
     write_upstream(SLOT_CONFIG["a"]["port"])
-    start_nginx()
+    nginx_pid = start_nginx()
 
     log("Performing initial index build ...")
     state = "BUILDING"
@@ -328,6 +409,37 @@ def main():
     log("Entering watch loop ...")
     while True:
         time.sleep(1)
+
+        # --- Supervision -----------------------------------------------
+        # Nothing else watches the active qlever-server or the nginx
+        # master: if either dies, nginx would keep proxying to (or simply
+        # stop listening on) a dead backend while PID 1 stays up, so
+        # `restart: unless-stopped` never triggers. Detect that here and
+        # exit non-zero so the container's restart policy can recover.
+
+        # Check active_proc FIRST (before reap_zombies()) so Python's own
+        # Popen bookkeeping gets to observe/reap its exit before our
+        # generic zombie sweep below could reap it out from under it.
+        if active_proc is not None and active_proc.poll() is not None:
+            log(
+                f"qlever-server (active slot={active_slot}) exited "
+                f"unexpectedly with returncode={active_proc.returncode} — "
+                f"exiting orchestrator so the container restart policy "
+                f"can recover"
+            )
+            sys.exit(1)
+
+        if not nginx_is_alive(nginx_pid):
+            log(
+                f"nginx master (pid={nginx_pid}) is no longer running — "
+                f"port 7001 has stopped listening; exiting orchestrator "
+                f"so the container restart policy can recover"
+            )
+            sys.exit(1)
+
+        # Mop up any other reparented children (e.g. orphaned nginx
+        # workers) so they don't accumulate as zombies under PID 1.
+        reap_zombies()
 
         with state_lock:
             if state == "IDLE" and debounce_deadline is not None:
