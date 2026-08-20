@@ -242,14 +242,34 @@ def watch_data_dir(event_callback):
             "--format", "%w%f",
             "/data",
         ]
-        log("Starting inotifywait on /data ...")
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        for line in proc.stdout:
-            path = line.decode(errors="replace").strip()
-            # Only react to RDF triple files
-            if path.endswith((".nt", ".ttl", ".n3")):
-                log(f"FS change detected: {path}")
-                event_callback()
+        # inotifywait can exit on its own (watch limit hit, killed, /data
+        # unmounted, ...); restart it rather than let the watcher die silently.
+        while True:
+            log("Starting inotifywait on /data ...")
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+
+            # Drain stderr in its own thread so it doesn't block: inotifywait
+            # writes "Setting up watches" and one line per failed watch there,
+            # and an undrained pipe fills up and makes it hang in write().
+            def _drain_stderr(proc: subprocess.Popen) -> None:
+                for line in proc.stderr:
+                    log(f"[inotifywait] {line.decode(errors='replace').rstrip()}")
+
+            t_stderr = threading.Thread(target=_drain_stderr, args=(proc,), daemon=True)
+            t_stderr.start()
+
+            for line in proc.stdout:
+                path = line.decode(errors="replace").strip()
+                # Only react to RDF triple files
+                if path.endswith((".nt", ".ttl", ".n3")):
+                    log(f"FS change detected: {path}")
+                    event_callback()
+
+            rc = proc.wait()
+            log(f"inotifywait exited rc={rc} — restarting watcher in 5s")
+            time.sleep(5)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
