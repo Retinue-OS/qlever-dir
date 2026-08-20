@@ -72,6 +72,25 @@ def strip_quotes(v):
     return v
 
 
+def validate_iri_field(field_name, value):
+    """Validate that value is safe for use in an IRIREF.
+
+    Illegal characters: space, <, >, ", {, }, |, ^, backtick, backslash, control chars.
+    """
+    # Check for illegal characters
+    illegal_chars = set(' <>"{}|^`\\')
+    # Also check for control characters (0x00-0x1F and 0x7F)
+    for char in value:
+        if char in illegal_chars or ord(char) < 0x20 or ord(char) == 0x7F:
+            fail(f"field '{field_name}' contains invalid IRI character: {repr(value)}")
+
+
+def validate_date_field(field_name, value):
+    """Validate that value matches ISO 8601 date format YYYY-MM-DD."""
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', value):
+        fail(f"field '{field_name}' must be a date in ISO 8601 format (YYYY-MM-DD), got: {repr(value)}")
+
+
 def ttl_string(v):
     esc = v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
     return f'"{esc}"'
@@ -90,6 +109,7 @@ def main():
     pid = fm.get("id")
     if not pid:
         fail("frontmatter is missing required field: id")
+    validate_iri_field("id", pid)
     subject = f"<{SUBJECT_BASE}project:{pid}>"
 
     out = [
@@ -108,16 +128,19 @@ def main():
         if kind == "str":
             obj = ttl_string(value)
         elif kind == "date":
+            validate_date_field(field, value)
             obj = f'"{value}"^^xsd:date'
         elif kind == "bool":
             obj = "true" if str(value).lower() in ("true", "yes", "1") else "false"
         elif kind == "iri-actor":
+            validate_iri_field(field, value)
             obj = actor_iri(value)
         triples.append(f"    p:{pred} {obj}")
 
     for link in fm.get("links", []):
         # A value with a URI scheme becomes an IRI; otherwise a plain literal.
         if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", link):
+            validate_iri_field("links", link)
             triples.append(f"    p:link <{link}>")
         else:
             triples.append(f"    p:link {ttl_string(link)}")
