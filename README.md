@@ -125,6 +125,58 @@ converter) is in [`examples/projects/`](examples/projects).
 > rebuild. Only mount data you trust to also run its converters. Without any
 > `converters.json`, behaviour is unchanged — only `.nt`/`.ttl`/`.n3` are read.
 
+## Excluding files with `.qleverignore`
+
+A data directory ("chamber") can exclude its own files from the index scan by
+dropping a `.qleverignore` file next to them — without the container needing
+to know anything about it, and without any other chamber being affected.
+This is the mechanism for a store that legitimately owns a file (e.g. a large
+dump that belongs in a dedicated store) but doesn't want it picked up here.
+
+```
+genetics/
+  .qleverignore        ← genetics.nt
+  genetics.nt           excluded, matched by the pattern above
+  summary.ttl            still indexed
+```
+
+**File format.** One glob pattern per line, relative to the directory
+containing the `.qleverignore`. Blank lines and lines starting with `#` are
+ignored; trailing whitespace is stripped.
+
+```
+# .qleverignore in the "genetics" directory
+genetics.nt
+dumps/*.nt
+**/*.big.ttl
+```
+
+**Pattern semantics:**
+
+- A pattern is matched against the candidate file's path *relative to the
+  directory holding the `.qleverignore`* (glob syntax, e.g. `*`, `?`, `[...]`
+  — Python's `fnmatch`).
+- A pattern containing no `/` (e.g. `genetics.nt`) also matches by basename
+  at any depth under that directory, the same as plain gitignore patterns
+  do.
+- A pattern containing `/` (e.g. `dumps/*.nt`) is anchored to that
+  directory: it matches `dumps/x.nt` but not `other/dumps/x.nt` or a
+  `dumps/` one level further down.
+- Every ancestor directory of a candidate file, up to `/data`, that holds a
+  `.qleverignore` is consulted, and a match from **any** of them excludes
+  the file — a pattern in one chamber's `.qleverignore` never reaches into
+  another chamber's subtree, but within one chamber's own subtree, nearer
+  and farther `.qleverignore` files are simply pooled together.
+
+**Not supported: negation.** Gitignore's `!pattern` re-inclusion syntax is
+intentionally not implemented, to keep the semantics simple and unambiguous
+(no "nearest wins" resolution to reason about). A `!`-prefixed line is
+skipped with a warning logged to stderr rather than applied.
+
+A change to a `.qleverignore` file triggers a rebuild, the same as a change
+to `.qlever/converters.json` — it changes what gets indexed even though its
+own content never is.
+
 ## Parse errors are visible through the SPARQL endpoint
 
 If a file fails to parse, the build does not abort. Instead of that file's

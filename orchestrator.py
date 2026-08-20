@@ -356,6 +356,11 @@ def classify_watch_event(path: str, flags: str, converter_exts: set[str]) -> str
         (build_index.sh's find excludes */.qlever/* from the index scan, so
         this file's own content is never indexed — but it can WIDEN the set
         of extensions that ARE indexed, so it must still trigger a rebuild)
+      - the file is a .qleverignore itself                 -> "qleverignore"
+        (never indexed either — it has no RDF/converter extension — but it
+        changes which files build_index.sh's filter drops, so it must still
+        trigger a rebuild. Unlike converters-json this can't change
+        converter_exts, so no cache refresh is needed here.)
       - the file's extension is a currently-known converter
         extension                                          -> "converter-extension"
     """
@@ -365,6 +370,8 @@ def classify_watch_event(path: str, flags: str, converter_exts: set[str]) -> str
         return "isdir"
     if os.path.basename(path) == "converters.json" and "/.qlever/" in path:
         return "converters-json"
+    if os.path.basename(path) == ".qleverignore":
+        return "qleverignore"
     ext = os.path.splitext(path)[1].lstrip(".").lower()
     if ext and ext in converter_exts:
         return "converter-extension"
@@ -427,6 +434,8 @@ def watch_data_dir(event_callback):
                     log(f"FS change detected: {path} (flags: {flags}) — triggering rebuild to rescan directory")
                 elif reason == "converters-json":
                     log(f"FS change detected: {path} (flags: {flags}) — converters.json changed, refreshed extension set to {sorted(converter_exts) or '(none)'} — triggering rebuild")
+                elif reason == "qleverignore":
+                    log(f"FS change detected: {path} (flags: {flags}) — .qleverignore changed — triggering rebuild")
                 elif reason == "converter-extension":
                     ext = os.path.splitext(path)[1].lstrip(".").lower()
                     log(f"FS change detected: {path} — converter extension '.{ext}' — triggering rebuild")

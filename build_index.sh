@@ -38,6 +38,14 @@
 # whose target is missing or is not a regular file cannot be indexed either
 # way, so it gets a diagnostic quad of its own instead of being silently
 # dropped from the scan.
+#
+# A data directory can exclude files from its own subtree by dropping a
+# .qleverignore file next to them — one gitignore-style glob pattern per
+# line, relative to the directory containing that .qleverignore. This lets a
+# chamber declare its own exclusions (e.g. a large dump meant for a different
+# store) without the container needing to know about it. See
+# filter_qleverignore() below and the README for the exact pattern semantics
+# (notably: no "!" negation support).
 
 set -euo pipefail
 
@@ -56,6 +64,16 @@ cd "${INDEX_DIR}"
 cat > "${INDEX_NAME}.settings.json" <<'EOF'
 { "num-triples-per-batch": 500000 }
 EOF
+
+# Track parse/convert failures across the pipeline subshell via a shared file
+# (the for-loop runs in a subshell because of the pipe to qlever-index), and
+# hold the .qleverignore filter script (see filter_qleverignore() below) —
+# it needs to live in a real file because the filter needs the *pipe* for
+# its stdin (the NUL-separated candidate paths), which a heredoc would
+# otherwise steal.
+ERRORS_FILE=$(mktemp)
+QLEVERIGNORE_FILTER=$(mktemp)
+trap 'rm -f "${ERRORS_FILE}" "${QLEVERIGNORE_FILTER}"' EXIT
 
 # Extensions that have a converter declared in any .qlever/converters.json
 # under /data. Files with these extensions are routed through their converter
@@ -107,6 +125,124 @@ mapfile -d '' RDF_FILES < <(
 mapfile -d '' BROKEN_SYMLINKS < <(
     find "${FIND_BASE[@]}" -type l -not -xtype f -print0 2>/dev/null | sort -z
 )
+
+# .qleverignore: reads NUL-separated absolute candidate paths on stdin,
+# writes the ones that survive filtering NUL-separated to stdout. A file is
+# dropped if it matches a pattern in a .qleverignore found in its own
+# directory or any ancestor up to /data (any match from any ancestor
+# excludes it — there is no "nearest wins" and no negation). See the README
+# for the full pattern semantics; this is deliberately a small subset of
+# real gitignore behaviour.
+cat > "${QLEVERIGNORE_FILTER}" <<'PY'
+import fnmatch
+import os
+import sys
+
+data_root = os.path.abspath("/data")
+
+
+def log(msg):
+    print(f"[build_index] {msg}", file=sys.stderr)
+
+
+# Discover every .qleverignore under data_root, skipping .git and .qlever
+# directories (same directories the RDF scan itself excludes).
+ignore_files = []
+for dirpath, dirnames, filenames in os.walk(data_root):
+    dirnames[:] = [d for d in dirnames if d not in (".git", ".qlever")]
+    if ".qleverignore" in filenames:
+        ignore_files.append(os.path.join(dirpath, ".qleverignore"))
+
+# directory -> list of glob patterns declared by that directory's .qleverignore
+patterns_by_dir = {}
+for path in ignore_files:
+    d = os.path.dirname(path)
+    patterns = []
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError as e:
+        log(f".qleverignore ERROR {path}: {e}")
+        continue
+    for line in text.splitlines():
+        line = line.rstrip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        if line.startswith("!"):
+            log(
+                f".qleverignore WARNING {path}: negation ('!') patterns are "
+                f"not supported and this line is ignored: {line}"
+            )
+            continue
+        patterns.append(line)
+    patterns_by_dir[d] = patterns
+
+exclude_counts = {d: 0 for d in patterns_by_dir}
+
+
+def excluding_dir(filepath):
+    """The directory of the first (closest-or-not, any) .qleverignore whose
+    patterns match filepath, or None if no ancestor .qleverignore matches."""
+    d = os.path.dirname(filepath)
+    while True:
+        patterns = patterns_by_dir.get(d)
+        if patterns:
+            rel = os.path.relpath(filepath, d)
+            base = os.path.basename(filepath)
+            for pat in patterns:
+                if fnmatch.fnmatchcase(rel, pat):
+                    return d
+                # A pattern without '/' also matches the basename at any
+                # depth under this directory (gitignore behaviour).
+                if "/" not in pat and fnmatch.fnmatchcase(base, pat):
+                    return d
+        if d == data_root:
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+stdin_bytes = sys.stdin.buffer.read()
+candidates = stdin_bytes.split(b"\0") if stdin_bytes else []
+if candidates and candidates[-1] == b"":
+    candidates = candidates[:-1]
+
+out = sys.stdout.buffer
+for candidate in candidates:
+    filepath = candidate.decode("utf-8", errors="surrogateescape")
+    excl_dir = excluding_dir(filepath)
+    if excl_dir is None:
+        out.write(candidate)
+        out.write(b"\0")
+    else:
+        exclude_counts[excl_dir] += 1
+
+for d in sorted(exclude_counts):
+    count = exclude_counts[d]
+    if count > 0:
+        rel_d = os.path.relpath(d, data_root)
+        label = "." if rel_d == "." else rel_d
+        log(f"Excluded {count} file(s) via {label}/.qleverignore")
+PY
+
+filter_qleverignore() {
+    python3 "${QLEVERIGNORE_FILTER}"
+}
+
+# Guard against empty arrays: printf '%s\0' with no arguments still emits a
+# single NUL, which would round-trip as one empty-string "file".
+if [[ ${#RDF_FILES[@]} -gt 0 ]]; then
+    mapfile -d '' RDF_FILES < <(
+        printf '%s\0' "${RDF_FILES[@]}" | filter_qleverignore
+    )
+fi
+if [[ ${#BROKEN_SYMLINKS[@]} -gt 0 ]]; then
+    mapfile -d '' BROKEN_SYMLINKS < <(
+        printf '%s\0' "${BROKEN_SYMLINKS[@]}" | filter_qleverignore
+    )
+fi
 
 # Escape a string for use inside an N-Triples/N-Quads literal:
 #   backslash -> \\, double-quote -> \", any C0 control char (newline, tab,
@@ -171,11 +307,6 @@ while True:
     d = parent
 PY
 }
-
-# Track parse/convert failures across the pipeline subshell via a shared file
-# (the for-loop runs in a subshell because of the pipe to qlever-index).
-ERRORS_FILE=$(mktemp)
-trap 'rm -f "${ERRORS_FILE}"' EXIT
 
 # Emit a diagnostic quad for a file that could not be processed, and record it.
 emit_error_quad() {
