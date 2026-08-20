@@ -239,7 +239,7 @@ def watch_data_dir(event_callback):
             "-m",          # monitor mode (don't exit after first event)
             "-r",          # recursive
             "-e", "close_write,create,delete,move",
-            "--format", "%w%f",
+            "--format", "%e %w%f",
             "/data",
         ]
         # inotifywait can exit on its own (watch limit hit, killed, /data
@@ -261,10 +261,16 @@ def watch_data_dir(event_callback):
             t_stderr.start()
 
             for line in proc.stdout:
-                path = line.decode(errors="replace").strip()
-                # Only react to RDF triple files
-                if path.endswith((".nt", ".ttl", ".n3")):
-                    log(f"FS change detected: {path}")
+                line_str = line.decode(errors="replace").strip()
+                # Split event flags from path (flags never contain spaces; paths may)
+                flags, _, path = line_str.partition(" ")
+                # Trigger rebuild on RDF triple files or directory events
+                # (directory events include newly-created dirs in watch scope)
+                if path.endswith((".nt", ".ttl", ".n3")) or "ISDIR" in flags:
+                    if "ISDIR" in flags:
+                        log(f"FS change detected: {path} (flags: {flags}) — triggering rebuild to rescan directory")
+                    else:
+                        log(f"FS change detected: {path}")
                     event_callback()
 
             rc = proc.wait()
