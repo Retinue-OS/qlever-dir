@@ -60,6 +60,13 @@ EOF
 # Extensions that have a converter declared in any .qlever/converters.json
 # under /data. Files with these extensions are routed through their converter
 # (see find_converter / stream_as_nquads) instead of being parsed as RDF.
+#
+# KEEP IN SYNC: orchestrator.py's converter_extensions() mirrors this inline
+# python3 heredoc line-for-line in semantics (same glob, same "keys of each
+# JSON object, lstrip('.'), lower(), ignore unreadable/invalid files"). The
+# orchestrator's inotify watcher uses it to decide which non-RDF file
+# extensions should trigger a rebuild, so it must agree with what this
+# script actually indexes. If you change one, change the other.
 mapfile -t CONVERTER_EXTS < <(
     python3 - <<'PY'
 import glob, json, os

@@ -24,6 +24,8 @@ This guarantees no two rebuilds run in parallel, but rebuilds run back-to-back
 if the filesystem keeps changing during a build.
 """
 
+import glob
+import json
 import os
 import signal
 import subprocess
@@ -308,8 +310,65 @@ def do_rebuild(active_slot: str | None, active_proc: subprocess.Popen | None):
 
 
 # ---------------------------------------------------------------------------
+# Converter-extension discovery
+# ---------------------------------------------------------------------------
+
+
+def converter_extensions(data_root: str = "/data") -> set[str]:
+    """Extensions with a converter declared in some .qlever/converters.json
+    under data_root, e.g. {"md", "csv"}.
+
+    KEEP IN SYNC: this mirrors the inline `python3 -` heredoc in
+    build_index.sh (the one that populates CONVERTER_EXTS) line-for-line in
+    semantics — same glob, same "keys of each JSON object, lstrip('.'),
+    lower(), ignore unreadable/invalid files". build_index.sh decides what
+    gets indexed; this decides what the watcher reacts to, and the two sets
+    must agree or the watcher will miss (or spuriously fire for) files the
+    builder does/doesn't pick up. If you change one, change the other.
+    """
+    exts = set()
+    for cfg in glob.glob(f"{data_root}/**/.qlever/converters.json", recursive=True):
+        try:
+            mapping = json.load(open(cfg))
+        except Exception:
+            continue
+        for key in mapping:
+            exts.add(key.lstrip(".").lower())
+    return exts
+
+
+# ---------------------------------------------------------------------------
 # inotify watcher
 # ---------------------------------------------------------------------------
+
+
+def classify_watch_event(path: str, flags: str, converter_exts: set[str]) -> str | None:
+    """Decide whether an inotify event line should trigger a rebuild.
+
+    Returns a short reason string (for logging) if it should, or None if the
+    event should be ignored. converter_exts is the caller's current cached
+    result of converter_extensions() — this function never re-globs.
+
+    Trigger rules, in order:
+      - native RDF extension (.nt/.ttl/.n3)              -> "rdf-extension"
+      - a directory event (ISDIR in flags)                -> "isdir"
+      - the file is a .qlever/converters.json itself       -> "converters-json"
+        (build_index.sh's find excludes */.qlever/* from the index scan, so
+        this file's own content is never indexed — but it can WIDEN the set
+        of extensions that ARE indexed, so it must still trigger a rebuild)
+      - the file's extension is a currently-known converter
+        extension                                          -> "converter-extension"
+    """
+    if path.endswith((".nt", ".ttl", ".n3")):
+        return "rdf-extension"
+    if "ISDIR" in flags:
+        return "isdir"
+    if os.path.basename(path) == "converters.json" and "/.qlever/" in path:
+        return "converters-json"
+    ext = os.path.splitext(path)[1].lstrip(".").lower()
+    if ext and ext in converter_exts:
+        return "converter-extension"
+    return None
 
 
 def watch_data_dir(event_callback):
@@ -323,6 +382,15 @@ def watch_data_dir(event_callback):
             "--format", "%e %w%f",
             "/data",
         ]
+        # Cache of converter extensions (e.g. {"md", "csv"}), so we don't
+        # re-glob /data/**/.qlever/converters.json on every single event.
+        # Computed fresh each time inotifywait (re)starts, and refreshed
+        # whenever a converters.json change or a directory event is seen —
+        # either can introduce/remove a .qlever/converters.json and change
+        # the set.
+        converter_exts = converter_extensions()
+        log(f"Converter extensions: {sorted(converter_exts) or '(none)'}")
+
         # inotifywait can exit on its own (watch limit hit, killed, /data
         # unmounted, ...); restart it rather than let the watcher die silently.
         while True:
@@ -345,14 +413,26 @@ def watch_data_dir(event_callback):
                 line_str = line.decode(errors="replace").strip()
                 # Split event flags from path (flags never contain spaces; paths may)
                 flags, _, path = line_str.partition(" ")
-                # Trigger rebuild on RDF triple files or directory events
-                # (directory events include newly-created dirs in watch scope)
-                if path.endswith((".nt", ".ttl", ".n3")) or "ISDIR" in flags:
-                    if "ISDIR" in flags:
-                        log(f"FS change detected: {path} (flags: {flags}) — triggering rebuild to rescan directory")
-                    else:
-                        log(f"FS change detected: {path}")
-                    event_callback()
+                reason = classify_watch_event(path, flags, converter_exts)
+                if reason is None:
+                    continue
+
+                if reason in ("isdir", "converters-json"):
+                    # A new directory or a changed converters.json can widen
+                    # (or narrow) the indexable extension set — refresh the
+                    # cache before the next ordinary-file event relies on it.
+                    converter_exts = converter_extensions()
+
+                if reason == "isdir":
+                    log(f"FS change detected: {path} (flags: {flags}) — triggering rebuild to rescan directory")
+                elif reason == "converters-json":
+                    log(f"FS change detected: {path} (flags: {flags}) — converters.json changed, refreshed extension set to {sorted(converter_exts) or '(none)'} — triggering rebuild")
+                elif reason == "converter-extension":
+                    ext = os.path.splitext(path)[1].lstrip(".").lower()
+                    log(f"FS change detected: {path} — converter extension '.{ext}' — triggering rebuild")
+                else:  # rdf-extension
+                    log(f"FS change detected: {path}")
+                event_callback()
 
             rc = proc.wait()
             log(f"inotifywait exited rc={rc} — restarting watcher in 5s")
