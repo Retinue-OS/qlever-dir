@@ -3,7 +3,9 @@
 #
 # Scans /data for .nt, .ttl, .n3 files. For each file, parses it via rapper
 # into canonical N-Triples and converts every triple into a quad by appending
-# a graph IRI derived from the file path:
+# a graph IRI derived from the file path. Blank node labels are rewritten
+# with a per-file prefix (derived from the relative path) so that rapper's
+# per-invocation "_:genid1"-style labels never collide across files.
 #
 #   graph IRI = <BASE_URI><percent-encoded relative path from /data>
 #
@@ -215,18 +217,58 @@ stream_as_nquads() {
 
     if rapper -q -i "${format}" -o ntriples "${source}" \
             > "${stdout_file}" 2> "${stderr_file}"; then
+        # Blank node label prefix for this file: rapper labels blank nodes
+        # per invocation (_:genid1, _:genid2, ...), so without rewriting,
+        # two files would hand qlever-index the same labels and their blank
+        # nodes would merge into one. The prefix must itself be a legal
+        # BLANK_NODE_LABEL prefix (start with a letter — no '%', no '/'),
+        # so it is a short hash of relpath rather than relpath itself.
+        local bnode_prefix
+        bnode_prefix="b$(printf '%s' "${relpath}" | md5sum | cut -c1-12)"
+
         # Append the graph IRI by replacing the trailing " ." rapper's
-        # ntriples output always ends each line with. The IRI is passed to
-        # awk via ENVIRON (not -v, and not interpolated into the program
-        # text) so it is treated purely as data: no backslash-escape
-        # decoding and no '&'-means-matched-text sub()/gsub() replacement
-        # magic can corrupt it, however it or the filename it was derived
-        # from is spelled.
-        G="${graph_iri}" awk '{
+        # ntriples output always ends each line with, and rewrite blank
+        # node labels to carry this file's prefix. The IRI and prefix are
+        # passed to awk via ENVIRON (not -v, and not interpolated into the
+        # program text) so they are treated purely as data: no
+        # backslash-escape decoding and no '&'-means-matched-text
+        # sub()/gsub() replacement magic can corrupt them, however they or
+        # the filename they were derived from are spelled.
+        #
+        # Blank nodes only ever appear, in rapper's canonical ntriples
+        # output, as the whole subject token (line starts with "_:") or as
+        # the whole object token (the last whitespace-delimited token
+        # before the trailing " ." that was just stripped). A literal
+        # object always ends with a closing '"' (optionally followed by
+        # ^^<...> or @lang), so it can never equal a bare "_:label" token —
+        # matching on those two exact token positions rewrites every real
+        # blank node and nothing inside a literal.
+        G="${graph_iri}" BNP="${bnode_prefix}" awk '{
             line = $0
             n = sub(/ \.$/, "", line)
-            if (n) print line " <" ENVIRON["G"] "> ."
-            else print $0
+            if (!n) { print $0; next }
+
+            prefix = ENVIRON["BNP"]
+
+            if (line ~ /^_:/) {
+                sp = index(line, " ")
+                label = substr(line, 3, sp - 3)
+                line = "_:" prefix "_" label substr(line, sp)
+            }
+
+            lastsp = 0
+            for (i = length(line); i > 0; i--) {
+                if (substr(line, i, 1) == " ") { lastsp = i; break }
+            }
+            if (lastsp > 0) {
+                lasttok = substr(line, lastsp + 1)
+                if (lasttok ~ /^_:[A-Za-z0-9_][A-Za-z0-9_.-]*$/) {
+                    label = substr(lasttok, 3)
+                    line = substr(line, 1, lastsp) "_:" prefix "_" label
+                }
+            }
+
+            print line " <" ENVIRON["G"] "> ."
         }' "${stdout_file}"
     else
         emit_error_quad "${graph_iri}" "${stderr_file}" "parse" "${filepath}"
