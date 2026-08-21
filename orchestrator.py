@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-orchestrator.py — Blue-green QLever index manager with inotify-based rebuild.
+orchestrator.py — Blue-green QLever index manager with incremental SPARQL
+Update and inotify-based rebuild.
 
 Slots:
   a -> index dir /index-a, port 7101
@@ -8,13 +9,33 @@ Slots:
 
 nginx on port 7001 proxies to the active slot.
 
-State machine:
-  IDLE      -> watching; the first FS change schedules a rebuild
+Two update paths now exist:
+  - INCREMENTAL (the common case): a single file's rdf-extension or
+    converter-extension change is applied straight to the ACTIVE slot via a
+    whole-graph SPARQL Update (DROP + INSERT DATA for that file's graph, or
+    DROP alone if the file went away or became ignored) — visible in
+    seconds, no rebuild, no swap.
+  - FULL REBUILD: still the blue-green build-into-idle-slot/health-check/
+    swap cycle below, but it is now a *compaction* pass, not the visibility
+    mechanism. It still runs for structural changes a single-file diff can't
+    express (a new/removed directory, a .qlever/converters.json or
+    .qleverignore edit — either can change which files are indexed at all),
+    and periodically once enough incremental deltas have piled up (see
+    COMPACTION_DELTA_TRIPLES) because QLever's query performance degrades as
+    unmerged delta triples accumulate (ad-freiburg/qlever#2449).
+
+State machine (drives FULL REBUILDs only — incremental updates bypass it
+entirely and are applied as soon as they're seen, debounced only by
+INCREMENTAL_DELAY):
+  IDLE      -> watching; the first qualifying change schedules a rebuild
                REBUILD_DELAY seconds in the future. Further changes during
                that window do not push back the deadline — this guarantees
                a rebuild starts at most REBUILD_DELAY seconds after the
                first change, even on a continuously changing directory.
-  BUILDING  -> rebuild running; further changes set change_pending=True
+               REBUILD_DELAY is now purely a compaction-debounce knob — it no
+               longer gates how soon a change is visible to queries.
+  BUILDING  -> rebuild running; further qualifying changes set
+               change_pending=True
 
 After a build completes in BUILDING state:
   - If change_pending: immediately start another build (stays BUILDING)
@@ -25,8 +46,10 @@ if the filesystem keeps changing during a build.
 """
 
 import glob
+import hashlib
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -34,6 +57,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -41,7 +65,11 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 BASE_URI = os.environ.get("BASE_URI", "https://example.org/data/")
+DATA_ROOT = os.environ.get("DATA_ROOT", "/data")
 REBUILD_DELAY = int(os.environ.get("REBUILD_DELAY", "15"))
+INCREMENTAL_DELAY = int(os.environ.get("INCREMENTAL_DELAY", "2"))
+COMPACTION_DELTA_TRIPLES = int(os.environ.get("COMPACTION_DELTA_TRIPLES", "100000"))
+RECONCILE_INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "3600"))
 
 SLOT_CONFIG = {
     "a": {"index_dir": "/index-a", "port": 7101},
@@ -49,6 +77,7 @@ SLOT_CONFIG = {
 }
 NGINX_UPSTREAM_FILE = "/run/nginx-upstream.conf"
 INDEX_NAME = "rdf-store"
+MAX_UPDATE_RETRIES = 5
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -58,6 +87,20 @@ INDEX_NAME = "rdf-store"
 def log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%dT%H:%M:%S")
     print(f"[{ts}] [orchestrator] {msg}", flush=True)
+
+
+def redact(text: str, token: str) -> str:
+    """Replace every occurrence of the access token with "[redacted]".
+
+    qlever-server prints the token in cleartext in its own startup banner,
+    and a URL we log ourselves can carry it as the access-token query
+    param — this is the one guard between either of those and the container
+    logs, so every log path that might echo untrusted/generated text that
+    could contain the token must run it through here first.
+    """
+    if not token:
+        return text
+    return text.replace(token, "[redacted]")
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +215,7 @@ def reap_zombies() -> None:
 # ---------------------------------------------------------------------------
 
 
-def start_qlever(slot: str) -> subprocess.Popen:
+def start_qlever(slot: str, token: str) -> subprocess.Popen:
     """Start qlever-server for the given slot and return the Popen object."""
     cfg = SLOT_CONFIG[slot]
     index_dir = cfg["index_dir"]
@@ -188,17 +231,24 @@ def start_qlever(slot: str) -> subprocess.Popen:
             "-c", "1G",
             "-e", "512M",
             "-k", "1000",
+            "-a", token,  # --access-token: gates writes/admin commands; see
+                          # ACCESS_TOKEN generation in main() for why this
+                          # replaces qlever-server's fail-closed
+                          # --no-access-check default rather than using it.
         ],
         cwd=index_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    # Drain server output in a daemon thread so it doesn't block
-    def _drain(proc: subprocess.Popen, slot: str) -> None:
+    # Drain server output in a daemon thread so it doesn't block. qlever-server
+    # prints the access token in cleartext in its own startup banner — redact
+    # every line before it ever reaches the container logs.
+    def _drain(proc: subprocess.Popen, slot: str, token: str) -> None:
         for line in proc.stdout:
-            print(f"[qlever-server:{slot}] {line.decode(errors='replace').rstrip()}", flush=True)
+            text = line.decode(errors="replace").rstrip()
+            print(f"[qlever-server:{slot}] {redact(text, token)}", flush=True)
 
-    t = threading.Thread(target=_drain, args=(proc, slot), daemon=True)
+    t = threading.Thread(target=_drain, args=(proc, slot, token), daemon=True)
     t.start()
     return proc
 
@@ -259,13 +309,331 @@ def build_index(slot: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Companion scripts (emit_file.sh, qleverignore_filter.py) — resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_companion_script(name: str, executable: bool) -> str:
+    """Resolve a companion script the same way build_index.sh resolves
+    EMIT_FILE / QLEVERIGNORE_FILTER_PY: prefer BIN_DIR (default
+    /usr/local/bin, where the Dockerfile COPYs it), falling back to
+    alongside this file so a repo checkout (e.g. under test) works without
+    installing anything system-wide. `executable` selects which test
+    build_index.sh uses for that script (-x for emit_file.sh, -f for
+    qleverignore_filter.py, which is invoked as `python3 <path>` rather than
+    directly)."""
+    bin_dir = os.environ.get("BIN_DIR", "/usr/local/bin")
+    installed = os.path.join(bin_dir, name)
+    ok = os.access(installed, os.X_OK) if executable else os.path.isfile(installed)
+    if ok:
+        return installed
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
+
+def emit_file_sh() -> str:
+    return _resolve_companion_script("emit_file.sh", executable=True)
+
+
+def qleverignore_filter_py() -> str:
+    return _resolve_companion_script("qleverignore_filter.py", executable=False)
+
+
+# ---------------------------------------------------------------------------
+# SPARQL Update — incremental per-file whole-graph replace
+# ---------------------------------------------------------------------------
+
+
+def is_ignored(filepath: str) -> bool:
+    """True if qleverignore_filter.py says filepath is excluded by some
+    .qleverignore under DATA_ROOT."""
+    result = subprocess.run(
+        ["python3", qleverignore_filter_py(), "--check", filepath],
+        env={**os.environ, "DATA_ROOT": DATA_ROOT},
+    )
+    return result.returncode == 1
+
+
+def graph_iri_for(filepath: str) -> str:
+    """The percent-encoded graph IRI for filepath, via emit_file.sh
+    graph-iri — the single authority for that computation (see emit_file.sh's
+    module docstring), so this can never drift from what a build indexed it
+    under."""
+    result = subprocess.run(
+        [emit_file_sh(), "graph-iri", filepath],
+        env={**os.environ, "DATA_ROOT": DATA_ROOT, "BASE_URI": BASE_URI},
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def sparql_update(port: int, update_str: str, token: str, timeout: int = 60) -> bool:
+    """POST update_str as a SPARQL 1.1 Update request to the slot on PORT.
+
+    The token is presented BOTH as an `Authorization: Bearer` header and as
+    an `access-token` query parameter: QLever has historically accepted the
+    URL param for write/admin auth, and Bearer-header support is newer.
+    Sending both covers whichever the deployed qlever-server build actually
+    honours — VERIFY AT DEPLOY which one(s) it accepts, and drop the
+    redundant one once confirmed.
+
+    Returns whether the request succeeded (HTTP 2xx). Never logs the token
+    itself; the request URL carries it in the query string, so any URL we
+    log is redacted first.
+    """
+    qs = urllib.parse.urlencode({"access-token": token})
+    url = f"http://127.0.0.1:{port}/?{qs}"
+    req = urllib.request.Request(
+        url,
+        data=update_str.encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/sparql-update",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if 200 <= resp.status < 300:
+                return True
+            log(f"SPARQL update to port {port} failed: status={resp.status}")
+            return False
+    except urllib.error.HTTPError as e:
+        body = e.read(500).decode(errors="replace")
+        log(f"SPARQL update to port {port} failed: status={e.code} body={redact(body, token)!r}")
+        return False
+    except Exception as e:
+        log(f"SPARQL update to port {port} failed: {redact(str(e), token)}")
+        return False
+
+
+def apply_file_update(port: int, token: str, filepath: str) -> tuple[bool, int]:
+    """Whole-graph replace for one source file against the slot on PORT:
+    DROP the file's graph and, if the file still exists and isn't
+    .qleverignore'd, INSERT its current triples — both in ONE SPARQL 1.1
+    Update request (a ';'-separated sequence), so there is never a window
+    where the graph is empty between the DROP and the INSERT.
+
+    Returns (success, triple_count). triple_count is 0 for a DROP-only
+    update: the file was deleted/moved away, is now ignored, or (for a
+    converter-extension file) has no applicable converter and therefore
+    produced no triples.
+    """
+    graph_iri = graph_iri_for(filepath)
+
+    # lexists (not exists!): a broken symlink must still go through
+    # emit_file.sh, which detects the brokenness itself and emits a
+    # diagnostic triple for it — exactly like a full build would. Only a
+    # path with no filesystem entry at all (deleted/moved-away) counts as
+    # "gone" here.
+    exists = os.path.lexists(filepath)
+    ignored = exists and is_ignored(filepath)
+
+    if not exists or ignored:
+        update = f"DROP SILENT GRAPH <{graph_iri}>"
+        triple_count = 0
+    else:
+        result = subprocess.run(
+            [emit_file_sh(), "triples", filepath],
+            env={**os.environ, "DATA_ROOT": DATA_ROOT, "BASE_URI": BASE_URI},
+            capture_output=True,
+            text=True,
+        )
+        triples = result.stdout
+        if not triples.strip():
+            update = f"DROP SILENT GRAPH <{graph_iri}>"
+            triple_count = 0
+        else:
+            # The graph MUST be named explicitly in both halves: an
+            # unqualified INSERT DATA writes to QLever's default graph and
+            # reports success while changing nothing an application ever
+            # queries (ad-freiburg/qlever#1730) — never drop the `GRAPH <g>`
+            # wrapper here even for a "just insert" refactor later. DROP
+            # SILENT so a graph that doesn't exist yet (first update for a
+            # brand-new file) doesn't fail the sequence — VERIFY AT DEPLOY
+            # that this qlever-server build's DROP SILENT actually no-ops on
+            # a missing graph; if not, the fallback primitive is
+            # `DELETE WHERE { GRAPH <g> { ?s ?p ?o } }`.
+            update = (
+                f"DROP SILENT GRAPH <{graph_iri}> ;\n"
+                f"INSERT DATA {{ GRAPH <{graph_iri}> {{\n{triples}}} }}"
+            )
+            triple_count = triples.count("\n")
+
+    ok = sparql_update(port, update, token)
+    return ok, triple_count
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation sweep
+# ---------------------------------------------------------------------------
+
+
+def load_manifest(index_dir: str) -> dict[str, str]:
+    """graph_iri -> md5 (or "broken-symlink"), from a slot's manifest.tsv as
+    build_index.sh last wrote it. Missing file (e.g. a slot that has never
+    been built) -> empty manifest, everything currently on disk looks new."""
+    manifest: dict[str, str] = {}
+    path = os.path.join(index_dir, "manifest.tsv")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                h, _, g = line.partition("\t")
+                manifest[g] = h
+    except FileNotFoundError:
+        log(f"reconcile: no manifest.tsv at {path} — treating baseline as empty")
+    return manifest
+
+
+def file_hash(filepath: str) -> str:
+    """md5 of filepath's bytes, matching build_index.sh's `md5sum < file`
+    (source bytes, not converter output). "broken-symlink" for a symlink
+    whose target is missing or not a regular file, matching manifest.tsv's
+    convention that there are no bytes to hash there."""
+    if os.path.islink(filepath) and not os.path.isfile(filepath):
+        return "broken-symlink"
+    h = hashlib.md5()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def scan_source_files(data_root: str) -> list[str]:
+    """Every file reconcile() should consider: .nt/.ttl/.n3 plus any
+    converter extension, skipping .git and .qlever directories,
+    .qleverignore'd files excluded. Mirrors build_index.sh's `find`
+    selection (KEEP IN SYNC, same as converter_extensions() above).
+
+    os.walk(..., followlinks=False) already gives us -P semantics for free
+    (a symlinked directory is listed but never descended into), and — per
+    its documented behaviour — a broken symlink's DirEntry.is_dir() reports
+    False, so broken symlinks land in `filenames` right alongside regular
+    files and working symlinks; no separate broken-symlink pass is needed
+    here the way build_index.sh's `find -type l -not -xtype f` needs one.
+    """
+    exts = {"nt", "ttl", "n3"} | converter_extensions(data_root)
+    found = []
+    for dirpath, dirnames, filenames in os.walk(data_root, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d not in (".git", ".qlever")]
+        for name in filenames:
+            ext = os.path.splitext(name)[1].lstrip(".").lower()
+            if ext in exts:
+                found.append(os.path.join(dirpath, name))
+    if not found:
+        return []
+    # One batch invocation of the filter (NUL-separated, same as
+    # build_index.sh uses it) instead of a --check subprocess per file —
+    # this sweep runs in the supervision loop, so per-file process startups
+    # would stall liveness checks for the whole scan.
+    result = subprocess.run(
+        ["python3", qleverignore_filter_py()],
+        input=b"\0".join(f.encode("utf-8", "surrogateescape") for f in found) + b"\0",
+        env={**os.environ, "DATA_ROOT": data_root},
+        capture_output=True,
+    )
+    return [
+        f.decode("utf-8", "surrogateescape")
+        for f in result.stdout.split(b"\0")
+        if f
+    ]
+
+
+def filepath_for_graph(graph_iri: str) -> str:
+    """Reverse of emit_file.sh's graph-iri computation: recover the (maybe
+    no-longer-existing) source path a manifest graph IRI corresponds to, so
+    a vanished manifest entry can be dropped via apply_file_update — reusing
+    its "file doesn't exist -> DROP SILENT" logic — rather than duplicating
+    that DROP-string construction here. Only meaningful for graph IRIs of
+    the BASE_URI + percent-encoded-relpath shape emit_file.sh produces,
+    which is everything in our own manifest.tsv (we are the only writer of
+    graph IRIs deployed here)."""
+    relpath = urllib.parse.unquote(graph_iri[len(BASE_URI):])
+    return os.path.join(DATA_ROOT, relpath)
+
+
+def reconcile(port: int, token: str, index_dir: str, overlay: dict[str, str]) -> tuple[int, int, int]:
+    """Compare the active slot's build-time manifest.tsv against DATA_ROOT's
+    CURRENT state and patch any drift via apply_file_update. Backstop for
+    the incremental path: catches anything a coalesced/lost inotify event,
+    an incremental update that exhausted its retries, or an edge case in
+    event classification let slip through.
+
+    manifest.tsv on disk is intentionally never rewritten by this sweep —
+    it stays the build's own snapshot, which is what the NEXT full rebuild's
+    replay-before-swap step (see do_rebuild) and any human debugging it
+    reasonably expect it to mean. Instead, confirmed fixes are tracked in
+    `overlay` (graph_iri -> current hash, "" for a dropped graph), mutated
+    in place and kept by the caller across calls, so repeated sweeps don't
+    re-apply the same fix. The caller resets it to {} whenever a new slot
+    becomes active (new manifest baseline, old overlay meaningless).
+
+    Bounded and simple by design: O(files) with one md5 read each,
+    sequential — no threading, no batching.
+
+    Returns (scanned, reapplied, dropped).
+    """
+    manifest = load_manifest(index_dir)
+    current_files = scan_source_files(DATA_ROOT)
+
+    scanned = len(current_files)
+    reapplied = 0
+    dropped = 0
+    seen_graphs = set()
+
+    for filepath in current_files:
+        graph_iri = graph_iri_for(filepath)
+        seen_graphs.add(graph_iri)
+        current_hash = file_hash(filepath)
+        known_hash = overlay.get(graph_iri, manifest.get(graph_iri))
+        if current_hash == known_hash:
+            continue
+        ok, _ = apply_file_update(port, token, filepath)
+        if ok:
+            overlay[graph_iri] = current_hash
+            reapplied += 1
+            log(f"reconcile: re-applied {filepath} (graph={graph_iri})")
+        else:
+            log(f"reconcile: FAILED to re-apply {filepath} (graph={graph_iri}) — will retry next sweep")
+
+    for graph_iri in manifest:
+        if graph_iri in seen_graphs:
+            continue
+        if overlay.get(graph_iri) == "":
+            continue  # already dropped by an earlier sweep
+        filepath = filepath_for_graph(graph_iri)
+        ok, _ = apply_file_update(port, token, filepath)
+        if ok:
+            overlay[graph_iri] = ""
+            dropped += 1
+            log(f"reconcile: dropped {graph_iri} (source file no longer present: {filepath})")
+        else:
+            log(f"reconcile: FAILED to drop {graph_iri} — will retry next sweep")
+
+    if reapplied + dropped > 0:
+        log(f"reconcile: scanned {scanned}, re-applied {reapplied}, dropped {dropped}")
+    return scanned, reapplied, dropped
+
+
+# ---------------------------------------------------------------------------
 # Blue-green rebuild
 # ---------------------------------------------------------------------------
 
 
-def do_rebuild(active_slot: str | None, active_proc: subprocess.Popen | None):
+def do_rebuild(
+    active_slot: str | None,
+    active_proc: subprocess.Popen | None,
+    token: str,
+    dirty_paths: set[str],
+    dirty_lock: threading.Lock,
+):
     """
-    Full blue-green rebuild cycle.
+    Full blue-green rebuild cycle — now also a compaction pass: it folds
+    every incremental delta applied since the current active slot's own
+    last build into one clean index.
 
     Builds into the slot opposite of active_slot. If active_slot is None
     (initial build), uses slot "a".
@@ -284,12 +652,36 @@ def do_rebuild(active_slot: str | None, active_proc: subprocess.Popen | None):
         log("Rebuild aborted: index build failed; keeping current slot active")
         return active_slot, active_proc
 
-    new_proc = start_qlever(target_slot)
+    new_proc = start_qlever(target_slot, token)
 
     if not health_check(target_port):
         log("Rebuild aborted: new instance failed health check; keeping current slot active")
         stop_qlever(new_proc, target_slot)
         return active_slot, active_proc
+
+    # Replay-before-flip: the scan build_index.sh just ran may predate any
+    # filesystem changes that landed while it was building (or, for the
+    # initial build, before the watcher even started). Take the CURRENT
+    # dirty_paths snapshot now — after the scan, right before the slot goes
+    # live — and apply each one against the new slot so it never serves
+    # data staler than what's already been (or is about to be) visible on
+    # the outgoing active slot. A superset snapshot is fine: apply_file_update
+    # is a full whole-graph replace, so replaying an already-current path is
+    # a harmless no-op, not a correctness problem.
+    with dirty_lock:
+        replay_snapshot = set(dirty_paths)
+    if replay_snapshot:
+        log(f"Replaying {len(replay_snapshot)} pending change(s) into slot={target_slot} before swap")
+        succeeded = set()
+        for filepath in replay_snapshot:
+            ok, _ = apply_file_update(target_port, token, filepath)
+            if ok:
+                succeeded.add(filepath)
+            else:
+                log(f"Replay FAILED for {filepath} against slot={target_slot} — leaving it dirty; "
+                    f"reconciliation sweep will catch it. Not aborting the swap.")
+        with dirty_lock:
+            dirty_paths.difference_update(succeeded)
 
     write_upstream(target_port)
     reload_nginx()
@@ -379,7 +771,10 @@ def classify_watch_event(path: str, flags: str, converter_exts: set[str]) -> str
 
 
 def watch_data_dir(event_callback):
-    """Run inotifywait in a background thread; call event_callback on changes."""
+    """Run inotifywait in a background thread; call event_callback(path, reason)
+    on every qualifying change — reason is whatever classify_watch_event()
+    returned (never None; None events are filtered out below and never
+    reach the callback)."""
     def _run():
         cmd = [
             "inotifywait",
@@ -441,7 +836,7 @@ def watch_data_dir(event_callback):
                     log(f"FS change detected: {path} — converter extension '.{ext}' — triggering rebuild")
                 else:  # rdf-extension
                     log(f"FS change detected: {path}")
-                event_callback()
+                event_callback(path, reason)
 
             rc = proc.wait()
             log(f"inotifywait exited rc={rc} — restarting watcher in 5s")
@@ -457,26 +852,79 @@ def watch_data_dir(event_callback):
 
 
 def main():
-    log(f"Starting orchestrator BASE_URI={BASE_URI} REBUILD_DELAY={REBUILD_DELAY}s")
+    # Generated fresh per container start: this is what gates every write/
+    # admin request qlever-server accepts, replacing its fail-closed
+    # --no-access-check default. Never logged in the clear — see redact()
+    # and every call site below that touches it.
+    token = secrets.token_hex(32)
+
+    log(
+        f"Starting orchestrator BASE_URI={BASE_URI} REBUILD_DELAY={REBUILD_DELAY}s "
+        f"INCREMENTAL_DELAY={INCREMENTAL_DELAY}s "
+        f"COMPACTION_DELTA_TRIPLES={COMPACTION_DELTA_TRIPLES} "
+        f"RECONCILE_INTERVAL={RECONCILE_INTERVAL}s"
+    )
 
     active_slot: str | None = None
     active_proc: subprocess.Popen | None = None
 
-    state = "IDLE"          # "IDLE" | "BUILDING"
+    state = "IDLE"          # "IDLE" | "BUILDING" — drives FULL REBUILDs only
     change_pending = False
     debounce_deadline: float | None = None
     state_lock = threading.Lock()
 
-    def on_fs_change():
+    # --- Incremental-update bookkeeping, all protected by state_lock (reused
+    # rather than adding a second lock — see module docstring). ------------
+    # path -> time it becomes eligible for the drain loop to apply it. Set to
+    # (now + INCREMENTAL_DELAY) on every qualifying FS event for that path —
+    # a dict, so repeated events on the same file naturally coalesce into
+    # one entry, and each new event pushes eligibility out, so a burst of
+    # writes from one editor save is applied once, after the burst quiets
+    # down, not once per event.
+    pending: dict[str, float] = {}
+    pending_retries: dict[str, int] = {}   # path -> retry count so far
+    # Every path changed since the currently-building (or about to build)
+    # slot's manifest was scanned — replayed into the new slot right before
+    # it goes live (see do_rebuild), cleared per-path only once replayed
+    # successfully. A superset is harmless (whole-graph replace is
+    # idempotent), so this is never cleared just because the ordinary
+    # incremental drain below also happened to apply the same path.
+    dirty_paths: set[str] = set()
+    delta_triples_applied = 0   # reset to 0 whenever a full rebuild completes
+
+    # In-memory reconcile() overlay (graph_iri -> current hash / "" for
+    # dropped) — see reconcile()'s docstring for why this exists instead of
+    # rewriting manifest.tsv. Reset whenever active_slot changes: a new slot
+    # means a new manifest.tsv baseline, so the old overlay no longer means
+    # anything.
+    reconcile_overlay: dict[str, str] = {}
+    next_reconcile_at: float | None = None
+
+    def schedule_rebuild(reason: str):
         nonlocal debounce_deadline, change_pending
         with state_lock:
             if state == "IDLE":
                 if debounce_deadline is None:
                     debounce_deadline = time.time() + REBUILD_DELAY
-                    log(f"Rebuild scheduled in {REBUILD_DELAY}s")
+                    log(f"Rebuild scheduled in {REBUILD_DELAY}s ({reason})")
             else:
                 change_pending = True
-                log("Change detected during build: queuing one more rebuild")
+                log(f"Change detected during build: queuing one more rebuild ({reason})")
+
+    def on_fs_change(path: str, reason: str):
+        # Structural changes (a new/removed directory, or something that can
+        # change *which* files get indexed at all) can't be expressed as a
+        # single-file diff — they still need a full rescan/rebuild.
+        if reason in ("isdir", "converters-json", "qleverignore"):
+            schedule_rebuild(reason)
+            return
+        # rdf-extension / converter-extension: one file's content changed.
+        # Route it to the incremental path instead — no debounce-triggered
+        # rebuild at all.
+        eligible_at = time.time() + INCREMENTAL_DELAY
+        with state_lock:
+            pending[path] = eligible_at
+            dirty_paths.add(path)
 
     Path("/run").mkdir(parents=True, exist_ok=True)
     write_upstream(SLOT_CONFIG["a"]["port"])
@@ -484,12 +932,16 @@ def main():
 
     log("Performing initial index build ...")
     state = "BUILDING"
-    active_slot, active_proc = do_rebuild(None, None)
+    active_slot, active_proc = do_rebuild(None, None, token, dirty_paths, state_lock)
     state = "IDLE"
     if active_slot is None:
         log("Initial build failed — exiting")
         sys.exit(1)
     log(f"Initial build complete. Active slot={active_slot}")
+    reconcile_overlay = {}
+    reconcile(SLOT_CONFIG[active_slot]["port"], token, SLOT_CONFIG[active_slot]["index_dir"], reconcile_overlay)
+    if RECONCILE_INTERVAL > 0:
+        next_reconcile_at = time.time() + RECONCILE_INTERVAL
 
     # Start filesystem watcher
     watch_data_dir(on_fs_change)
@@ -530,6 +982,69 @@ def main():
         # workers) so they don't accumulate as zombies under PID 1.
         reap_zombies()
 
+        # --- Incremental updates -----------------------------------------
+        # Applied straight to the ACTIVE slot, independent of the BUILDING
+        # state machine above — a compaction rebuild running in the
+        # background targeting the idle slot does not pause these.
+        if active_slot is not None:
+            now = time.time()
+            with state_lock:
+                ready = [p for p, eligible_at in pending.items() if now >= eligible_at]
+                for p in ready:
+                    del pending[p]
+            if ready:
+                active_port = SLOT_CONFIG[active_slot]["port"]
+                for filepath in ready:
+                    ok, triple_count = apply_file_update(active_port, token, filepath)
+                    if ok:
+                        with state_lock:
+                            pending_retries.pop(filepath, None)
+                        # A DROP-only update (triple_count == 0) still
+                        # changed the index — it counts as 1 delta, not 0,
+                        # so an all-deletions workload still triggers
+                        # compaction eventually.
+                        delta_triples_applied += triple_count if triple_count > 0 else 1
+                        if delta_triples_applied >= COMPACTION_DELTA_TRIPLES:
+                            log(
+                                f"delta_triples_applied={delta_triples_applied} >= "
+                                f"COMPACTION_DELTA_TRIPLES={COMPACTION_DELTA_TRIPLES} — "
+                                f"scheduling a compaction rebuild"
+                            )
+                            schedule_rebuild("compaction")
+                    else:
+                        with state_lock:
+                            retries = pending_retries.get(filepath, 0) + 1
+                            if retries > MAX_UPDATE_RETRIES:
+                                pending_retries.pop(filepath, None)
+                                log(
+                                    f"ERROR: giving up on incremental update for {filepath} "
+                                    f"after {MAX_UPDATE_RETRIES} retries — the reconciliation "
+                                    f"sweep will catch it"
+                                )
+                            else:
+                                pending_retries[filepath] = retries
+                                pending[filepath] = time.time() + 30
+                                log(
+                                    f"Incremental update failed for {filepath} "
+                                    f"(attempt {retries}/{MAX_UPDATE_RETRIES}) — retrying in 30s"
+                                )
+        # active_slot is None (initial build still running): pending/dirty
+        # entries are simply left as-is and picked up once it completes.
+
+        # --- Periodic reconciliation sweep --------------------------------
+        if (
+            active_slot is not None
+            and next_reconcile_at is not None
+            and time.time() >= next_reconcile_at
+        ):
+            reconcile(
+                SLOT_CONFIG[active_slot]["port"],
+                token,
+                SLOT_CONFIG[active_slot]["index_dir"],
+                reconcile_overlay,
+            )
+            next_reconcile_at = time.time() + RECONCILE_INTERVAL
+
         with state_lock:
             if state == "IDLE" and debounce_deadline is not None:
                 if time.time() >= debounce_deadline:
@@ -544,9 +1059,26 @@ def main():
         if trigger_build:
             log("Debounce expired — starting rebuild")
             while True:
-                new_slot, new_proc = do_rebuild(active_slot, active_proc)
+                prev_slot = active_slot
+                new_slot, new_proc = do_rebuild(active_slot, active_proc, token, dirty_paths, state_lock)
                 active_slot = new_slot
                 active_proc = new_proc
+
+                if active_slot != prev_slot:
+                    # A swap actually happened (as opposed to do_rebuild
+                    # aborting and returning the slot unchanged): this is a
+                    # fresh manifest baseline, and every incremental delta
+                    # applied against the old active slot is now folded in.
+                    delta_triples_applied = 0
+                    reconcile_overlay = {}
+                    reconcile(
+                        SLOT_CONFIG[active_slot]["port"],
+                        token,
+                        SLOT_CONFIG[active_slot]["index_dir"],
+                        reconcile_overlay,
+                    )
+                    if RECONCILE_INTERVAL > 0:
+                        next_reconcile_at = time.time() + RECONCILE_INTERVAL
 
                 with state_lock:
                     if change_pending:

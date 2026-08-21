@@ -32,6 +32,9 @@ RUN chmod +x /usr/local/bin/build_index.sh /usr/local/bin/emit_file.sh \
 
 ENV BASE_URI=https://example.org/data/
 ENV REBUILD_DELAY=15
+ENV INCREMENTAL_DELAY=2
+ENV COMPACTION_DELTA_TRIPLES=100000
+ENV RECONCILE_INTERVAL=3600
 
 EXPOSE 7001
 
