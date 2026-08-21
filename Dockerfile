@@ -24,8 +24,11 @@ RUN ln -sf /dev/stdout /var/log/nginx/access.log && \
 
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY build_index.sh /usr/local/bin/build_index.sh
+COPY emit_file.sh /usr/local/bin/emit_file.sh
+COPY qleverignore_filter.py /usr/local/bin/qleverignore_filter.py
 COPY orchestrator.py /usr/local/bin/orchestrator.py
-RUN chmod +x /usr/local/bin/build_index.sh /usr/local/bin/orchestrator.py
+RUN chmod +x /usr/local/bin/build_index.sh /usr/local/bin/emit_file.sh \
+    /usr/local/bin/qleverignore_filter.py /usr/local/bin/orchestrator.py
 
 ENV BASE_URI=https://example.org/data/
 ENV REBUILD_DELAY=15
