@@ -308,6 +308,50 @@ Each rebuild cycle (also the compaction pass — see
 6. Stop the old QLever server.
 7. Run a reconciliation sweep against the newly active slot.
 
+## Resuming across a restart
+
+By default `/index-a` and `/index-b` are plain container storage: a restart
+starts with both empty, so the container always serves 502s for the whole
+duration of the first rebuild — the same wait every time, however briefly the
+container was down.
+
+Mount `/index-a` and `/index-b` on volumes (or bind mounts) that survive a
+restart and this changes: on startup the orchestrator looks for the slot with
+the most recently **completed** build (never a build a crash interrupted
+mid-way — see `find_resumable_slot()` in `orchestrator.py`) and, if one
+exists, starts serving it immediately while a full rebuild runs in the
+background against the other slot to catch up on anything that changed while
+the container was down. Once that rebuild's health check passes, traffic
+swaps to it exactly like an ordinary blue-green rebuild — the resumed slot is
+never left stale on purpose, only used to avoid a needless gap in service.
+
+A rebuild still always runs on startup, resumed or not: the point of
+persisting the index isn't to skip that (the container genuinely cannot know
+what changed in `/data` while it was down), only to keep answering queries
+from the last known-good build while it does.
+
+```yaml
+services:
+  sparql:
+    build: .
+    volumes:
+      - ./my-data:/data:ro
+      - index-a:/index-a
+      - index-b:/index-b
+    # ...
+
+volumes:
+  index-a:
+  index-b:
+```
+
+If a resumed slot's `qlever-server` fails to come up healthy within
+`RESUME_HEALTH_CHECK_TIMEOUT` seconds (120 by default — shorter than a normal
+rebuild's health-check timeout, since a slot that's going to fail, e.g. an
+index left by an incompatible `qlever-server` version after an image update,
+almost always fails fast), it's discarded and startup falls back to a fresh
+build exactly as if nothing had been persisted.
+
 ## Full rebuild scheduling
 
 A **structural** change (new/removed directory, `.qlever/converters.json`,
