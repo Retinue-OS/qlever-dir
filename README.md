@@ -50,6 +50,7 @@ graph names and would conflict with that model.
 | `REBUILD_DELAY` | `15` | Seconds to wait after the last *structural* filesystem event (or after crossing `COMPACTION_DELTA_TRIPLES`) before triggering a full rebuild. Debounces rapid structural changes; it is no longer the latency for ordinary content changes — see `INCREMENTAL_DELAY`. |
 | `COMPACTION_DELTA_TRIPLES` | `100000` | Cumulative delta triples (inserted, or 1 per dropped graph) applied incrementally since the last full rebuild before a compaction rebuild is scheduled. Keeps QLever's unmerged-delta query overhead bounded. |
 | `RECONCILE_INTERVAL` | `3600` | Seconds between reconciliation sweeps that diff the active slot's build-time manifest against the live filesystem and re-apply any drift. `0` disables the periodic sweep (a sweep still runs once after every slot swap). |
+| `HEALTH_CHECK_TIMEOUT` | `300` | Seconds a newly started `qlever-server` may take to answer its first query before its slot is rejected. Applies to freshly built slots and to a slot resumed after a restart alike; a server that exits fails immediately rather than waiting out the timeout. Raise it for very large indexes. |
 
 ## Quick start
 
@@ -82,6 +83,7 @@ services:
       # INCREMENTAL_DELAY: "2"             # seconds before a content change is applied
       # COMPACTION_DELTA_TRIPLES: "100000" # delta size that triggers a compaction rebuild
       # RECONCILE_INTERVAL: "3600"         # seconds between reconciliation sweeps (0 disables)
+      # HEALTH_CHECK_TIMEOUT: "300"        # seconds a new qlever-server may take to answer
     restart: unless-stopped
 ```
 
@@ -308,6 +310,77 @@ Each rebuild cycle (also the compaction pass — see
 6. Stop the old QLever server.
 7. Run a reconciliation sweep against the newly active slot.
 
+## Resuming across a restart
+
+On startup the orchestrator looks for the slot holding the most recently
+**completed** build — one that finished *and* proved servable, never a build
+a crash interrupted mid-way (see `find_resumable_slot()` in
+`orchestrator.py`). If it finds one, it starts serving that index immediately
+while a full rebuild runs in the background against the other slot to catch
+up on anything that changed while the container was down. Once that
+rebuild's health check passes, traffic swaps to it exactly like an ordinary
+blue-green rebuild — the resumed slot is never left stale on purpose, only
+used to avoid a needless gap in service.
+
+Whether there is anything to resume from depends on how `/index-a` and
+`/index-b` are stored:
+
+- **`docker restart` / `docker compose restart` of the same container**, or a
+  crash under `restart: unless-stopped`: the container's writable layer
+  survives, so the index dirs come back with the previous run's build in
+  them and the resume happens even with no volumes configured.
+- **The container is recreated** — an image update, `docker compose up`
+  after changing the service, `docker rm` + `docker run`: a fresh writable
+  layer means both index dirs come up empty. Unless `/index-a` and
+  `/index-b` are on named volumes or bind mounts, there is nothing to resume
+  from and the endpoint serves 502s for the whole first rebuild, as it did
+  before this feature.
+
+So mount them on volumes if you want the resume to survive image updates too:
+
+```yaml
+services:
+  sparql:
+    build: .
+    volumes:
+      - ./my-data:/data:ro
+      - index-a:/index-a
+      - index-b:/index-b
+    # ...
+
+volumes:
+  index-a:
+  index-b:
+```
+
+A rebuild still always runs on startup, resumed or not: the point of
+persisting the index isn't to skip that (the container genuinely cannot know
+what changed in `/data` while it was down), only to keep answering queries
+from the last known-good build while it does.
+
+If that startup rebuild fails, the resumed slot keeps serving — a stale
+index answers queries, an exited container doesn't — and the rebuild is
+retried every `REBUILD_DELAY` seconds until one succeeds. Without a slot to
+resume from there is nothing to fall back on, so a failed initial build still
+exits and lets the container's restart policy retry.
+
+The resumed slot stays supervised while that rebuild runs: a rebuild blocks
+for as long as it takes to build and health-check the other slot, so the
+orchestrator polls the serving `qlever-server` and the nginx master
+throughout it and exits non-zero the moment either dies, rather than leaving
+port 7001 down until the build happens to finish. Restarting is cheap now —
+the container comes back serving the completed index on disk.
+
+A resumed slot gets the same health check as any freshly built one:
+`HEALTH_CHECK_TIMEOUT` seconds (300 by default) for its `qlever-server` to
+answer a query, cut short the moment that server exits — so an index an
+incompatible `qlever-server` version cannot load after an image update is
+rejected within seconds rather than at the deadline, while a large index that
+simply takes a while to load still gets the full allowance. A slot that fails
+this check is discarded, its completed-build marker is removed so the next
+restart doesn't try it again, and startup falls back to a fresh build exactly
+as if nothing had been persisted.
+
 ## Full rebuild scheduling
 
 A **structural** change (new/removed directory, `.qlever/converters.json`,
@@ -328,6 +401,11 @@ path — see [Incremental updates](#incremental-updates):
   the idle slot.
 - **When the current rebuild finishes** and `change_pending` is set, the
   next rebuild starts immediately, without re-debouncing.
+- **When a rebuild fails** (the build itself, or the new slot never becoming
+  healthy): the active slot keeps serving unchanged, and another rebuild is
+  scheduled `REBUILD_DELAY` seconds later — no filesystem event is needed to
+  retry, since the change that triggered the rebuild has already been
+  consumed. Retries continue on that cadence until one succeeds.
 
 Two rebuilds never run in parallel. On a directory under continuous
 structural churn, you'll see a back-to-back rebuild loop with no idle gaps;
