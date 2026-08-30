@@ -364,6 +364,13 @@ retried every `REBUILD_DELAY` seconds until one succeeds. Without a slot to
 resume from there is nothing to fall back on, so a failed initial build still
 exits and lets the container's restart policy retry.
 
+The resumed slot stays supervised while that rebuild runs: a rebuild blocks
+for as long as it takes to build and health-check the other slot, so the
+orchestrator polls the serving `qlever-server` and the nginx master
+throughout it and exits non-zero the moment either dies, rather than leaving
+port 7001 down until the build happens to finish. Restarting is cheap now —
+the container comes back serving the completed index on disk.
+
 A resumed slot gets the same health check as any freshly built one:
 `HEALTH_CHECK_TIMEOUT` seconds (300 by default) for its `qlever-server` to
 answer a query, cut short the moment that server exits — so an index an

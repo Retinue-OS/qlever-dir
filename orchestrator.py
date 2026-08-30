@@ -295,6 +295,7 @@ def health_check(
     port: int,
     timeout_seconds: int = HEALTH_CHECK_TIMEOUT,
     proc: subprocess.Popen | None = None,
+    on_tick=None,
 ) -> bool:
     """Poll the SPARQL endpoint until it responds 200, the server dies, or
     the timeout expires.
@@ -306,6 +307,10 @@ def health_check(
     the wait ends when the process does, not when the deadline does. The
     timeout is then only what it should be: an upper bound for a server
     that is still alive and simply loading a large index.
+
+    `on_tick` is called once per poll — see do_rebuild(), which uses it to
+    keep supervising whatever is *currently* serving traffic while this
+    blocks on a slot that isn't serving anything yet.
     """
     url = f"http://127.0.0.1:{port}/api?query=ASK+%7B%7D&outputType=json"
     deadline = time.time() + timeout_seconds
@@ -313,6 +318,8 @@ def health_check(
     attempt = 0
     while time.time() < deadline:
         attempt += 1
+        if on_tick is not None:
+            on_tick()
         try:
             with urllib.request.urlopen(url, timeout=5) as resp:
                 if resp.status == 200:
@@ -369,8 +376,11 @@ def clear_build_complete(slot: str) -> None:
         log(f"WARNING: could not clear the completed-build marker for slot={slot}: {exc}")
 
 
-def build_index(slot: str) -> bool:
+def build_index(slot: str, on_tick=None) -> bool:
     """Build a fresh index into the given slot's index dir. Returns success.
+
+    `on_tick` is called about once a second while the build runs, so a caller
+    blocked here can keep supervising something else — see do_rebuild().
 
     Clears BUILD_COMPLETE_SENTINEL first: from the moment the build starts,
     this slot no longer holds the completed index it may have held before.
@@ -388,12 +398,20 @@ def build_index(slot: str) -> bool:
     index_dir = cfg["index_dir"]
     clear_build_complete(slot)
     log(f"Building index into slot={slot} dir={index_dir}")
-    result = subprocess.run(
+    # Popen + poll rather than subprocess.run: a build can run for minutes or
+    # hours, and on_tick has to keep firing throughout. An on_tick that exits
+    # the orchestrator leaves this child running for the instant it takes the
+    # container to go down with PID 1 — nothing to clean up by hand.
+    proc = subprocess.Popen(
         ["/usr/local/bin/build_index.sh", index_dir],
         env={**os.environ, "BASE_URI": BASE_URI},
     )
-    if result.returncode != 0:
-        log(f"Index build FAILED for slot={slot} (exit {result.returncode})")
+    while proc.poll() is None:
+        if on_tick is not None:
+            on_tick()
+        time.sleep(1)
+    if proc.returncode != 0:
+        log(f"Index build FAILED for slot={slot} (exit {proc.returncode})")
         return False
     log(f"Index build succeeded for slot={slot}")
     return True
@@ -747,6 +765,7 @@ def do_rebuild(
     token: str,
     dirty_paths: set[str],
     dirty_lock: threading.Lock,
+    on_tick=None,
 ):
     """
     Full blue-green rebuild cycle — now also a compaction pass: it folds
@@ -755,6 +774,13 @@ def do_rebuild(
 
     Builds into the slot opposite of active_slot. If active_slot is None
     (initial build), uses slot "a".
+
+    This blocks for the whole build and health check — potentially a long
+    time — and the caller's own supervision loop is not running meanwhile.
+    `on_tick` is called roughly once a second throughout, so the caller can
+    keep watching the slot that is still serving traffic (and nginx) and
+    fail fast if either dies mid-build instead of leaving the endpoint down
+    until the build happens to finish.
 
     Returns (new_active_slot, new_active_proc).
     """
@@ -766,13 +792,13 @@ def do_rebuild(
     target_port = SLOT_CONFIG[target_slot]["port"]
     log(f"Blue-green rebuild: building into slot={target_slot}")
 
-    if not build_index(target_slot):
+    if not build_index(target_slot, on_tick=on_tick):
         log("Rebuild aborted: index build failed; keeping current slot active")
         return active_slot, active_proc
 
     new_proc = start_qlever(target_slot, token)
 
-    if not health_check(target_port, proc=new_proc):
+    if not health_check(target_port, proc=new_proc, on_tick=on_tick):
         log("Rebuild aborted: new instance failed health check; keeping current slot active")
         stop_qlever(new_proc, target_slot)
         # No mark_build_complete(): the index built, but it could not be
@@ -1038,6 +1064,41 @@ def main():
                 change_pending = True
                 log(f"Change detected during build: queuing one more rebuild ({reason})")
 
+    def supervise_serving():
+        """Exit if whatever is currently serving traffic has died.
+
+        Nothing else watches the active qlever-server or the nginx master:
+        if either dies, nginx keeps proxying to (or simply stops listening
+        on) a dead backend while PID 1 stays up, so `restart: unless-stopped`
+        never triggers. Exiting non-zero hands recovery to the container's
+        restart policy — which, with a completed build on disk, comes back
+        serving that index almost immediately (see find_resumable_slot()).
+
+        Called both from the watch loop and — via do_rebuild's on_tick hook —
+        from inside a blocking rebuild: a rebuild can run for a long time,
+        and with a resumed slot answering queries the whole time, a death
+        that goes unnoticed until the build ends is exactly the outage this
+        resume path exists to prevent. do_rebuild() only ticks while it is
+        building and health-checking the *other* slot, never after it stops
+        the outgoing server, so a planned swap can never look like a death.
+        """
+        if active_proc is not None and active_proc.poll() is not None:
+            log(
+                f"qlever-server (active slot={active_slot}) exited "
+                f"unexpectedly with returncode={active_proc.returncode} — "
+                f"exiting orchestrator so the container restart policy "
+                f"can recover"
+            )
+            sys.exit(1)
+
+        if not nginx_is_alive(nginx_pid):
+            log(
+                f"nginx master (pid={nginx_pid}) is no longer running — "
+                f"port 7001 has stopped listening; exiting orchestrator "
+                f"so the container restart policy can recover"
+            )
+            sys.exit(1)
+
     def on_fs_change(path: str, reason: str):
         # Structural changes (a new/removed directory, or something that can
         # change *which* files get indexed at all) can't be expressed as a
@@ -1072,7 +1133,9 @@ def main():
         write_upstream(resume_port)
         nginx_pid = start_nginx()
         resume_proc = start_qlever(resume_slot, token)
-        if health_check(resume_port, proc=resume_proc):
+        # on_tick here only watches nginx: active_proc is still None, and
+        # resume_proc's own death is already the `proc=` check's job.
+        if health_check(resume_port, proc=resume_proc, on_tick=supervise_serving):
             active_slot, active_proc = resume_slot, resume_proc
             log(f"Resumed slot={resume_slot} is serving queries — catching up on any changes made while the container was down")
         else:
@@ -1092,7 +1155,10 @@ def main():
     else:
         log("Running the startup catch-up build while the resumed slot serves queries ...")
     state = "BUILDING"
-    active_slot, active_proc = do_rebuild(active_slot, active_proc, token, dirty_paths, state_lock)
+    active_slot, active_proc = do_rebuild(
+        active_slot, active_proc, token, dirty_paths, state_lock,
+        on_tick=supervise_serving,
+    )
     state = "IDLE"
     if active_slot is None:
         log("Initial build failed — exiting")
@@ -1126,31 +1192,10 @@ def main():
         time.sleep(1)
 
         # --- Supervision -----------------------------------------------
-        # Nothing else watches the active qlever-server or the nginx
-        # master: if either dies, nginx would keep proxying to (or simply
-        # stop listening on) a dead backend while PID 1 stays up, so
-        # `restart: unless-stopped` never triggers. Detect that here and
-        # exit non-zero so the container's restart policy can recover.
-
-        # Check active_proc FIRST (before reap_zombies()) so Python's own
-        # Popen bookkeeping gets to observe/reap its exit before our
-        # generic zombie sweep below could reap it out from under it.
-        if active_proc is not None and active_proc.poll() is not None:
-            log(
-                f"qlever-server (active slot={active_slot}) exited "
-                f"unexpectedly with returncode={active_proc.returncode} — "
-                f"exiting orchestrator so the container restart policy "
-                f"can recover"
-            )
-            sys.exit(1)
-
-        if not nginx_is_alive(nginx_pid):
-            log(
-                f"nginx master (pid={nginx_pid}) is no longer running — "
-                f"port 7001 has stopped listening; exiting orchestrator "
-                f"so the container restart policy can recover"
-            )
-            sys.exit(1)
+        # Runs FIRST, before reap_zombies(), so Python's own Popen
+        # bookkeeping gets to observe/reap the active server's exit before
+        # our generic zombie sweep below could reap it out from under it.
+        supervise_serving()
 
         # Mop up any other reparented children (e.g. orphaned nginx
         # workers) so they don't accumulate as zombies under PID 1.
@@ -1235,7 +1280,10 @@ def main():
             build_failed = False
             while True:
                 prev_slot = active_slot
-                new_slot, new_proc = do_rebuild(active_slot, active_proc, token, dirty_paths, state_lock)
+                new_slot, new_proc = do_rebuild(
+                    active_slot, active_proc, token, dirty_paths, state_lock,
+                    on_tick=supervise_serving,
+                )
                 active_slot = new_slot
                 active_proc = new_proc
                 # do_rebuild() always targets the *other* slot, so an
