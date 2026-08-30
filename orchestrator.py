@@ -44,15 +44,18 @@ After a build completes in BUILDING state:
 This guarantees no two rebuilds run in parallel, but rebuilds run back-to-back
 if the filesystem keeps changing during a build.
 
-Resuming across a restart: if /index-a and/or /index-b are backed by volumes
-that survive a container restart, main() serves whichever slot holds the most
-recently COMPLETED build immediately (see find_resumable_slot()) instead of
-sitting on 502s for a full rebuild — a full rebuild still always runs on
-startup regardless (the container couldn't see filesystem changes while it
-was down), but it targets the *other* slot, so the resumed slot keeps serving
-queries the whole time. On ephemeral (non-volume) index dirs this is a no-op:
-both slots are always empty after a restart, so startup behaves exactly as
-before this feature — one blocking build with no slot to resume from.
+Resuming across a restart: whenever /index-a and/or /index-b still hold the
+index of a previous run — always the case for `docker restart` of the same
+container, and across recreation too when those paths are volumes or bind
+mounts — main() immediately serves whichever slot holds the most recently
+COMPLETED build (see find_resumable_slot()) instead of sitting on 502s for a
+full rebuild. A full rebuild still always runs on startup regardless (the
+container couldn't see filesystem changes while it was down), but it targets
+the *other* slot, so the resumed slot keeps serving queries the whole time.
+When both index dirs come up empty — a first-ever start, or a container
+recreated without volumes on them — this is a no-op and startup behaves
+exactly as before this feature: one blocking build with no slot to resume
+from.
 """
 
 import glob
@@ -80,6 +83,12 @@ REBUILD_DELAY = int(os.environ.get("REBUILD_DELAY", "15"))
 INCREMENTAL_DELAY = int(os.environ.get("INCREMENTAL_DELAY", "2"))
 COMPACTION_DELTA_TRIPLES = int(os.environ.get("COMPACTION_DELTA_TRIPLES", "100000"))
 RECONCILE_INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "3600"))
+# Upper bound on how long a freshly started qlever-server may take to answer
+# its first query before the slot is considered failed. Generous by design:
+# load time grows with index size, and this is only an upper bound — a server
+# that dies is detected immediately (health_check() watches its process), so
+# raising it costs nothing on the failure path.
+HEALTH_CHECK_TIMEOUT = int(os.environ.get("HEALTH_CHECK_TIMEOUT", "300"))
 
 SLOT_CONFIG = {
     "a": {"index_dir": "/index-a", "port": 7101},
@@ -88,19 +97,11 @@ SLOT_CONFIG = {
 NGINX_UPSTREAM_FILE = "/run/nginx-upstream.conf"
 INDEX_NAME = "rdf-store"
 MAX_UPDATE_RETRIES = 5
-# Written into a slot's index dir by build_index() only after a build fully
-# succeeds — see find_resumable_slot() for why this, and not manifest.tsv,
-# is the signal a resume checks for.
+# Written into a slot's index dir only once a build has both finished AND
+# proven servable (its qlever-server passed a health check) — see
+# mark_build_complete() and find_resumable_slot() for why this, and not
+# manifest.tsv, is the signal a resume checks for.
 BUILD_COMPLETE_SENTINEL = ".orchestrator-build-complete"
-# How long to wait for a RESUMED slot's qlever-server to become healthy
-# before giving up on it and falling back to a fresh build. Shorter than
-# health_check()'s default 300s: loading a persisted index still takes real
-# time (proportional to its size), but a slot that's going to fail (missing
-# files, an index built by an incompatible qlever-server version after an
-# image update) almost always fails fast, and there is no point making a
-# cold start wait out a long timeout for a slot that was never going to work
-# — the fresh build below will produce a good index either way.
-RESUME_HEALTH_CHECK_TIMEOUT = 120
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -290,8 +291,22 @@ def stop_qlever(proc: subprocess.Popen, slot: str) -> None:
     log(f"Slot {slot} stopped")
 
 
-def health_check(port: int, timeout_seconds: int = 300) -> bool:
-    """Poll the SPARQL endpoint until it responds 200 or timeout."""
+def health_check(
+    port: int,
+    timeout_seconds: int = HEALTH_CHECK_TIMEOUT,
+    proc: subprocess.Popen | None = None,
+) -> bool:
+    """Poll the SPARQL endpoint until it responds 200, the server dies, or
+    the timeout expires.
+
+    Pass the server's Popen as `proc` whenever it is available: a
+    qlever-server that cannot serve its index at all (missing files, an
+    index written by an incompatible version) exits within seconds, and
+    noticing that exit is what makes a generous `timeout_seconds` cheap —
+    the wait ends when the process does, not when the deadline does. The
+    timeout is then only what it should be: an upper bound for a server
+    that is still alive and simply loading a large index.
+    """
     url = f"http://127.0.0.1:{port}/api?query=ASK+%7B%7D&outputType=json"
     deadline = time.time() + timeout_seconds
     log(f"Health-checking port {port} (timeout={timeout_seconds}s) ...")
@@ -305,6 +320,13 @@ def health_check(port: int, timeout_seconds: int = 300) -> bool:
                     return True
         except Exception:
             pass
+        if proc is not None and proc.poll() is not None:
+            log(
+                f"qlever-server for port {port} exited with "
+                f"returncode={proc.returncode} before becoming healthy — "
+                f"not waiting out the remaining timeout"
+            )
+            return False
         time.sleep(3)
     log(f"Port {port} did not become healthy within {timeout_seconds}s")
     return False
@@ -315,25 +337,56 @@ def health_check(port: int, timeout_seconds: int = 300) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _sentinel_path(slot: str) -> str:
+    return os.path.join(SLOT_CONFIG[slot]["index_dir"], BUILD_COMPLETE_SENTINEL)
+
+
+def mark_build_complete(slot: str) -> None:
+    """Record that this slot holds a build that is complete AND servable.
+
+    Called only once the slot's own qlever-server has passed a health check:
+    a successful qlever-index run alone does not prove the result can be
+    served (an index an incompatible qlever-server version cannot load still
+    builds fine), and find_resumable_slot() must never prefer a slot that
+    was already rejected once for exactly that reason.
+    """
+    try:
+        Path(_sentinel_path(slot)).touch()
+    except OSError as exc:
+        # Not fatal: the slot is serving either way, we just lose the
+        # ability to resume from it after a restart.
+        log(f"WARNING: could not mark slot={slot} as complete: {exc}")
+
+
+def clear_build_complete(slot: str) -> None:
+    """Drop this slot's completed-build marker — its index is being replaced,
+    or it has proven unservable and must not be resumed from again."""
+    try:
+        os.remove(_sentinel_path(slot))
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log(f"WARNING: could not clear the completed-build marker for slot={slot}: {exc}")
+
+
 def build_index(slot: str) -> bool:
     """Build a fresh index into the given slot's index dir. Returns success.
 
-    On success, touches BUILD_COMPLETE_SENTINEL in the slot's index dir —
-    the signal find_resumable_slot() looks for after a restart. build_index.sh
-    itself empties the index dir at the start of every build (removing any
-    prior sentinel along with everything else), but the sentinel is also
-    removed here first defensively, so a build that dies before that point
-    (or a future build_index.sh that stops emptying the dir) can never leave
-    a stale sentinel behind that would make an interrupted build look
-    complete.
+    Clears BUILD_COMPLETE_SENTINEL first: from the moment the build starts,
+    this slot no longer holds the completed index it may have held before.
+    build_index.sh itself empties the index dir at the start of every build
+    (removing any prior sentinel along with everything else), but clearing it
+    here too means a build that dies before that point — or a future
+    build_index.sh that stops emptying the dir — can never leave a stale
+    sentinel behind that would make an interrupted build look complete.
+
+    The sentinel is *written* by mark_build_complete(), not here: finishing
+    qlever-index is not yet proof the slot can be served, and only a servable
+    slot is worth resuming from.
     """
     cfg = SLOT_CONFIG[slot]
     index_dir = cfg["index_dir"]
-    sentinel = os.path.join(index_dir, BUILD_COMPLETE_SENTINEL)
-    try:
-        os.remove(sentinel)
-    except FileNotFoundError:
-        pass
+    clear_build_complete(slot)
     log(f"Building index into slot={slot} dir={index_dir}")
     result = subprocess.run(
         ["/usr/local/bin/build_index.sh", index_dir],
@@ -342,27 +395,26 @@ def build_index(slot: str) -> bool:
     if result.returncode != 0:
         log(f"Index build FAILED for slot={slot} (exit {result.returncode})")
         return False
-    Path(sentinel).touch()
     log(f"Index build succeeded for slot={slot}")
     return True
 
 
 def find_resumable_slot() -> str | None:
-    """The slot with the most recently COMPLETED build, if one survived a
-    restart — determined by BUILD_COMPLETE_SENTINEL's mtime, never
+    """The slot with the most recently COMPLETED build, if one survived into
+    this run — determined by BUILD_COMPLETE_SENTINEL's mtime, never
     manifest.tsv: build_index.sh writes that early, before the index is
     actually built (see its module comment), so its mere presence can't
     distinguish a finished index from one a crash interrupted mid-build.
 
-    Returns None when neither slot has a sentinel — a first-ever start, or
-    /index-a and /index-b are plain container storage rather than a mounted
-    volume, in which case both are always empty right after a restart and
-    behaviour is unchanged from before this feature (always start with a
-    fresh build; see main()).
+    Returns None when neither slot has a sentinel: a first-ever start, or a
+    container recreated (image update, `docker compose up` after an edit)
+    without volumes on /index-a and /index-b, so both index dirs came up
+    empty. Behaviour is then unchanged from before this feature — start with
+    a fresh build; see main().
     """
     candidates = []
-    for slot, cfg in SLOT_CONFIG.items():
-        sentinel = os.path.join(cfg["index_dir"], BUILD_COMPLETE_SENTINEL)
+    for slot in SLOT_CONFIG:
+        sentinel = _sentinel_path(slot)
         try:
             mtime = os.path.getmtime(sentinel)
         except FileNotFoundError:
@@ -720,10 +772,19 @@ def do_rebuild(
 
     new_proc = start_qlever(target_slot, token)
 
-    if not health_check(target_port):
+    if not health_check(target_port, proc=new_proc):
         log("Rebuild aborted: new instance failed health check; keeping current slot active")
         stop_qlever(new_proc, target_slot)
+        # No mark_build_complete(): the index built, but it could not be
+        # served, so it must not out-rank the still-healthy active slot as a
+        # resume candidate after a restart. build_index() already cleared
+        # any marker this slot carried from an earlier build.
         return active_slot, active_proc
+
+    # The index is built AND proven servable — only now is this slot worth
+    # resuming from after a restart. Written before the swap so that a crash
+    # between here and the flip still leaves the newest good index findable.
+    mark_build_complete(target_slot)
 
     # Replay-before-flip: the scan build_index.sh just ran may predate any
     # filesystem changes that landed while it was building (or, for the
@@ -994,15 +1055,16 @@ def main():
 
     Path("/run").mkdir(parents=True, exist_ok=True)
 
-    # Resume from a persisted index if one survived this restart, so the
-    # endpoint serves the last known-good build immediately instead of
-    # sitting on 502s for the whole first build — see find_resumable_slot().
-    # On ephemeral (non-volume) /index-a and /index-b, resume_slot is always
-    # None and this whole block is skipped, exactly matching pre-existing
-    # behaviour: rebuild from scratch is still correct here — the container
-    # couldn't react to filesystem changes while it was down — the point is
-    # only that a stale-but-valid index beats no index at all while catching
-    # up.
+    # Resume from an index that outlived the previous run, so the endpoint
+    # serves the last known-good build immediately instead of sitting on
+    # 502s for the whole first build — see find_resumable_slot(). When
+    # neither index dir carries a completed build (a first-ever start, or a
+    # recreated container without volumes on /index-a and /index-b),
+    # resume_slot is None and this whole block is skipped, exactly matching
+    # pre-existing behaviour: rebuild from scratch is still correct here —
+    # the container couldn't react to filesystem changes while it was down —
+    # the point is only that a stale-but-valid index beats no index at all
+    # while catching up.
     resume_slot = find_resumable_slot()
     if resume_slot is not None:
         resume_port = SLOT_CONFIG[resume_slot]["port"]
@@ -1010,25 +1072,46 @@ def main():
         write_upstream(resume_port)
         nginx_pid = start_nginx()
         resume_proc = start_qlever(resume_slot, token)
-        if health_check(resume_port, timeout_seconds=RESUME_HEALTH_CHECK_TIMEOUT):
+        if health_check(resume_port, proc=resume_proc):
             active_slot, active_proc = resume_slot, resume_proc
             log(f"Resumed slot={resume_slot} is serving queries — catching up on any changes made while the container was down")
         else:
             log(f"Resumed slot={resume_slot} failed its health check — discarding it and doing a fresh build instead")
             stop_qlever(resume_proc, resume_slot)
+            # Whatever is in that dir cannot be served by this image (an
+            # index written by an incompatible qlever-server version, say):
+            # don't let the next restart pay the same failed startup again.
+            clear_build_complete(resume_slot)
     else:
         write_upstream(SLOT_CONFIG["a"]["port"])
         nginx_pid = start_nginx()
 
-    if active_slot is None:
+    resumed_slot = active_slot   # None unless the block above resumed one
+    if resumed_slot is None:
         log("Performing initial index build ...")
+    else:
+        log("Running the startup catch-up build while the resumed slot serves queries ...")
     state = "BUILDING"
     active_slot, active_proc = do_rebuild(active_slot, active_proc, token, dirty_paths, state_lock)
     state = "IDLE"
     if active_slot is None:
         log("Initial build failed — exiting")
         sys.exit(1)
-    log(f"Startup build complete. Active slot={active_slot}")
+    if active_slot == resumed_slot:
+        # do_rebuild() aborted and handed the resumed slot straight back:
+        # nothing was swapped in, so the endpoint is still answering from an
+        # index built before the container went down. That is far better
+        # than exiting (restarting would only lose a working endpoint and
+        # retry the same build), but it must not be the end of the story —
+        # schedule the retry that the watch loop reschedules for as long as
+        # the build keeps failing.
+        log(
+            f"Startup catch-up build FAILED — slot={active_slot} keeps serving the "
+            f"index it resumed from, which may be stale; retrying in {REBUILD_DELAY}s"
+        )
+        schedule_rebuild("startup catch-up build failed")
+    else:
+        log(f"Startup build complete. Active slot={active_slot}")
     reconcile_overlay = {}
     reconcile(SLOT_CONFIG[active_slot]["port"], token, SLOT_CONFIG[active_slot]["index_dir"], reconcile_overlay)
     if RECONCILE_INTERVAL > 0:
@@ -1149,11 +1232,16 @@ def main():
 
         if trigger_build:
             log("Debounce expired — starting rebuild")
+            build_failed = False
             while True:
                 prev_slot = active_slot
                 new_slot, new_proc = do_rebuild(active_slot, active_proc, token, dirty_paths, state_lock)
                 active_slot = new_slot
                 active_proc = new_proc
+                # do_rebuild() always targets the *other* slot, so an
+                # unchanged slot means it aborted: the build failed, or the
+                # new slot never became healthy.
+                build_failed = active_slot == prev_slot
 
                 if active_slot != prev_slot:
                     # A swap actually happened (as opposed to do_rebuild
@@ -1177,8 +1265,16 @@ def main():
                         log("Queued change pending — starting next rebuild immediately")
                         continue
                     state = "IDLE"
-                    log("Rebuild complete — back to IDLE")
+                    log("Rebuild failed — back to IDLE" if build_failed
+                        else "Rebuild complete — back to IDLE")
                     break
+
+            if build_failed:
+                # The active slot is serving an index that is now known to be
+                # behind the filesystem, and no filesystem event is
+                # guaranteed to arrive to trigger another attempt. Keep
+                # retrying on the REBUILD_DELAY cadence until one succeeds.
+                schedule_rebuild("retrying the failed rebuild")
 
 
 def handle_sigterm(signum, frame):
