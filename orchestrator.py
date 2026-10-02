@@ -18,8 +18,10 @@ Two update paths now exist:
   - FULL REBUILD: still the blue-green build-into-idle-slot/health-check/
     swap cycle below, but it is now a *compaction* pass, not the visibility
     mechanism. It still runs for structural changes a single-file diff can't
-    express (a new/removed directory, a .qlever/converters.json or
-    .qleverignore edit — either can change which files are indexed at all),
+    express (a removed directory, a .qlever/converters.json or .qleverignore
+    edit — either can change which files are indexed at all), and for a new
+    directory only when it brings its own converters.json or .qleverignore;
+    an ordinary new directory just queues its files for the incremental path,
     and periodically once enough incremental deltas have piled up (see
     COMPACTION_DELTA_TRIPLES) because QLever's query performance degrades as
     unmerged delta triples accumulate (ad-freiburg/qlever#2449).
@@ -34,11 +36,14 @@ INCREMENTAL_DELAY):
                first change, even on a continuously changing directory.
                REBUILD_DELAY is now purely a compaction-debounce knob — it no
                longer gates how soon a change is visible to queries.
-  BUILDING  -> rebuild running; further qualifying changes set
-               change_pending=True
+  BUILDING  -> rebuild running; further qualifying changes are recorded,
+               by reason, in pending_rebuild_reasons
 
 After a build completes in BUILDING state:
-  - If change_pending: immediately start another build (stays BUILDING)
+  - If a queued reason still needs a rebuild: immediately start another
+    build (stays BUILDING). Reasons the post-swap reconcile() sweep already
+    settles (RECONCILE_COVERED_REASONS) are dropped once the swap succeeded
+    instead of paying for a second full build.
   - Else: return to IDLE
 
 This guarantees no two rebuilds run in parallel, but rebuilds run back-to-back
@@ -102,6 +107,16 @@ MAX_UPDATE_RETRIES = 5
 # mark_build_complete() and find_resumable_slot() for why this, and not
 # manifest.tsv, is the signal a resume checks for.
 BUILD_COMPLETE_SENTINEL = ".orchestrator-build-complete"
+
+# Queued-rebuild reasons that the reconcile() sweep run right after a
+# successful swap already settles, so they need no second full build:
+#   - dir-removed: the new slot's manifest was scanned during the build, so
+#     anything removed afterwards is in it and reconcile() drops it.
+#   - compaction: the build that just finished IS the compaction pass, and
+#     the delta counter is reset with the swap.
+# Everything else (converters.json, .qleverignore, unrecognised directory
+# events) still gets its queued rebuild.
+RECONCILE_COVERED_REASONS = {"dir-removed", "compaction"}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -638,11 +653,15 @@ def file_hash(filepath: str) -> str:
     return h.hexdigest()
 
 
-def scan_source_files(data_root: str) -> list[str]:
+def scan_source_files(data_root: str, start: str | None = None) -> list[str]:
     """Every file reconcile() should consider: .nt/.ttl/.n3 plus any
     converter extension, skipping .git and .qlever directories,
     .qleverignore'd files excluded. Mirrors build_index.sh's `find`
     selection (KEEP IN SYNC, same as converter_extensions() above).
+
+    `start` limits the walk to one subtree (a directory that just appeared,
+    see enqueue_new_directory()); the converter extensions and the
+    .qleverignore files that apply are still those of all of data_root.
 
     os.walk(..., followlinks=False) already gives us -P semantics for free
     (a symlinked directory is listed but never descended into), and — per
@@ -653,7 +672,7 @@ def scan_source_files(data_root: str) -> list[str]:
     """
     exts = {"nt", "ttl", "n3"} | converter_extensions(data_root)
     found = []
-    for dirpath, dirnames, filenames in os.walk(data_root, followlinks=False):
+    for dirpath, dirnames, filenames in os.walk(start or data_root, followlinks=False):
         dirnames[:] = [d for d in dirnames if d not in (".git", ".qlever")]
         for name in filenames:
             ext = os.path.splitext(name)[1].lstrip(".").lower()
@@ -895,8 +914,14 @@ def classify_watch_event(path: str, flags: str, converter_exts: set[str]) -> str
     result of converter_extensions() — this function never re-globs.
 
     Trigger rules, in order:
+      - anything inside a .git directory                  -> None
+        (never indexed — build_index.sh and scan_source_files() skip .git —
+        but every commit creates .git/objects/<xx>/ directories, which used
+        to set off a full rebuild per commit)
       - native RDF extension (.nt/.ttl/.n3)              -> "rdf-extension"
-      - a directory event (ISDIR in flags)                -> "isdir"
+      - a directory created or moved in                   -> "dir-created"
+      - a directory removed or moved away                 -> "dir-removed"
+      - any other directory event (ISDIR in flags)        -> "isdir"
       - the file is a .qlever/converters.json itself       -> "converters-json"
         (build_index.sh's find excludes */.qlever/* from the index scan, so
         this file's own content is never indexed — but it can WIDEN the set
@@ -909,9 +934,16 @@ def classify_watch_event(path: str, flags: str, converter_exts: set[str]) -> str
       - the file's extension is a currently-known converter
         extension                                          -> "converter-extension"
     """
+    if ".git" in Path(path).parts:
+        return None
     if path.endswith((".nt", ".ttl", ".n3")):
         return "rdf-extension"
     if "ISDIR" in flags:
+        events = set(flags.split(","))
+        if events & {"CREATE", "MOVED_TO"}:
+            return "dir-created"
+        if events & {"DELETE", "MOVED_FROM"}:
+            return "dir-removed"
         return "isdir"
     if os.path.basename(path) == "converters.json" and "/.qlever/" in path:
         return "converters-json"
@@ -921,6 +953,20 @@ def classify_watch_event(path: str, flags: str, converter_exts: set[str]) -> str
     if ext and ext in converter_exts:
         return "converter-extension"
     return None
+
+
+def subtree_is_structural(dirpath: str) -> bool:
+    """True if a directory that just appeared carries a .qlever/converters.json
+    or a .qleverignore anywhere beneath it — either can change which files
+    are indexed elsewhere too, so such a directory still needs a full
+    rebuild rather than enqueue-its-files."""
+    for root, dirnames, filenames in os.walk(dirpath, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        if ".qleverignore" in filenames:
+            return True
+        if os.path.basename(root) == ".qlever" and "converters.json" in filenames:
+            return True
+    return False
 
 
 def watch_data_dir(event_callback):
@@ -934,6 +980,10 @@ def watch_data_dir(event_callback):
             "-m",          # monitor mode (don't exit after first event)
             "-r",          # recursive
             "-e", "close_write,create,delete,move",
+            # Don't even place watches inside .git: besides the events
+            # (classify_watch_event() drops those too), a repository's
+            # objects/ fan-out costs hundreds of inotify watches.
+            "--exclude", r"(^|/)\.git(/|$)",
             "--format", "%e %w%f",
             "/data",
         ]
@@ -972,7 +1022,7 @@ def watch_data_dir(event_callback):
                 if reason is None:
                     continue
 
-                if reason in ("isdir", "converters-json"):
+                if reason in ("isdir", "dir-created", "dir-removed", "converters-json"):
                     # A new directory or a changed converters.json can widen
                     # (or narrow) the indexable extension set — refresh the
                     # cache before the next ordinary-file event relies on it.
@@ -980,6 +1030,10 @@ def watch_data_dir(event_callback):
 
                 if reason == "isdir":
                     log(f"FS change detected: {path} (flags: {flags}) — triggering rebuild to rescan directory")
+                elif reason == "dir-created":
+                    log(f"FS change detected: {path} (flags: {flags}) — new directory, queuing its files")
+                elif reason == "dir-removed":
+                    log(f"FS change detected: {path} (flags: {flags}) — directory removed — triggering rebuild")
                 elif reason == "converters-json":
                     log(f"FS change detected: {path} (flags: {flags}) — converters.json changed, refreshed extension set to {sorted(converter_exts) or '(none)'} — triggering rebuild")
                 elif reason == "qleverignore":
@@ -1022,7 +1076,10 @@ def main():
     active_proc: subprocess.Popen | None = None
 
     state = "IDLE"          # "IDLE" | "BUILDING" — drives FULL REBUILDs only
-    change_pending = False
+    # Reasons of the changes seen while a build was running — non-empty means
+    # one more rebuild is queued (see RECONCILE_COVERED_REASONS for which of
+    # them a successful swap settles on its own).
+    pending_rebuild_reasons: set[str] = set()
     debounce_deadline: float | None = None
     state_lock = threading.Lock()
 
@@ -1054,15 +1111,39 @@ def main():
     next_reconcile_at: float | None = None
 
     def schedule_rebuild(reason: str):
-        nonlocal debounce_deadline, change_pending
+        nonlocal debounce_deadline
         with state_lock:
             if state == "IDLE":
                 if debounce_deadline is None:
                     debounce_deadline = time.time() + REBUILD_DELAY
                     log(f"Rebuild scheduled in {REBUILD_DELAY}s ({reason})")
             else:
-                change_pending = True
+                pending_rebuild_reasons.add(reason)
                 log(f"Change detected during build: queuing one more rebuild ({reason})")
+
+    def enqueue_new_directory(dirpath: str):
+        """A directory appeared (created, or moved in with its contents).
+        Files written into it after inotifywait placed its watch arrive as
+        ordinary events; the ones that were already there by then — always
+        the case for a directory moved in, often for a git checkout writing
+        a whole new folder at once — never do. So walk it once and queue
+        every indexable file on the incremental path, exactly as if each had
+        had its own event. Only a directory that brings its own
+        converters.json or .qleverignore still needs a full rebuild."""
+        if not os.path.isdir(dirpath):
+            return  # gone again already; its removal event handles the rest
+        if subtree_is_structural(dirpath):
+            schedule_rebuild("dir-created with converters.json/.qleverignore")
+            return
+        files = scan_source_files(DATA_ROOT, start=dirpath)
+        if not files:
+            return
+        eligible_at = time.time() + INCREMENTAL_DELAY
+        with state_lock:
+            for filepath in files:
+                pending[filepath] = eligible_at
+                dirty_paths.add(filepath)
+        log(f"Queued {len(files)} file(s) under new directory {dirpath} for incremental update")
 
     def supervise_serving():
         """Exit if whatever is currently serving traffic has died.
@@ -1100,10 +1181,14 @@ def main():
             sys.exit(1)
 
     def on_fs_change(path: str, reason: str):
-        # Structural changes (a new/removed directory, or something that can
+        # A new directory is just its files arriving at once.
+        if reason == "dir-created":
+            enqueue_new_directory(path)
+            return
+        # Structural changes (a removed directory, or something that can
         # change *which* files get indexed at all) can't be expressed as a
         # single-file diff — they still need a full rescan/rebuild.
-        if reason in ("isdir", "converters-json", "qleverignore"):
+        if reason in ("isdir", "dir-removed", "converters-json", "qleverignore"):
             schedule_rebuild(reason)
             return
         # rdf-extension / converter-extension: one file's content changed.
@@ -1308,9 +1393,16 @@ def main():
                         next_reconcile_at = time.time() + RECONCILE_INTERVAL
 
                 with state_lock:
-                    if change_pending:
-                        change_pending = False
-                        log("Queued change pending — starting next rebuild immediately")
+                    if pending_rebuild_reasons and not build_failed:
+                        settled = pending_rebuild_reasons & RECONCILE_COVERED_REASONS
+                        if settled and not pending_rebuild_reasons - settled:
+                            log(f"Queued rebuild ({', '.join(sorted(settled))}) already "
+                                f"settled by the swap and reconcile — not rebuilding again")
+                            pending_rebuild_reasons.clear()
+                    if pending_rebuild_reasons:
+                        log(f"Queued change pending ({', '.join(sorted(pending_rebuild_reasons))}) "
+                            f"— starting next rebuild immediately")
+                        pending_rebuild_reasons.clear()
                         continue
                     state = "IDLE"
                     log("Rebuild failed — back to IDLE" if build_failed

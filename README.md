@@ -24,8 +24,9 @@ any directory of triples and you get a queryable store.
 3. Builds a QLever index and starts a SPARQL server.
 4. Watches `/data` with `inotifywait`. A change to one file's content is
    applied to the active slot via SPARQL Update after `INCREMENTAL_DELAY`
-   seconds of quiet — no rebuild. A structural change (new/removed
-   directory, `.qlever/converters.json`, `.qleverignore`) or enough
+   seconds of quiet — no rebuild; a new directory just queues its files
+   that way too. A structural change (removed directory,
+   `.qlever/converters.json`, `.qleverignore`) or enough
    accumulated incremental deltas (`COMPACTION_DELTA_TRIPLES`) instead
    schedules a full rebuild, debounced by `REBUILD_DELAY`. See
    [Incremental updates](#incremental-updates).
@@ -236,13 +237,25 @@ Most file changes never trigger a rebuild. A single file's content changing
    the full build (see [Files in this project](#files-in-this-project)), so
    the two can never disagree about how a file maps to RDF.
 
+**A new directory** (created, or moved in with its contents) takes the same
+path: the orchestrator walks it once and queues every indexable file in it as
+if each had had its own event — which matters, because files that were
+already there when the watch was placed (always the case for a moved-in
+directory, often for a `git pull` that adds a folder) never get one. Only a
+new directory that brings its own `.qlever/converters.json` or
+`.qleverignore` still schedules a full rebuild.
+
+**`.git` directories are not watched.** They are never indexed, and every
+commit creates `.git/objects/<xx>/` directories — which, when directory
+events still forced a rebuild, meant a full rebuild per commit.
+
 **What still forces a full rebuild.** A single-file diff can't express
 everything:
 
-- A **structural** change — a new/removed directory, or an edit to
-  `.qlever/converters.json` or `.qleverignore` — can change *which* files
-  are indexed at all, so it schedules a full rebuild, debounced by
-  `REBUILD_DELAY`.
+- A **structural** change — a removed directory, a new directory carrying
+  its own `.qlever/converters.json` or `.qleverignore`, or an edit to either
+  file — can change *which* files are indexed at all, so it schedules a full
+  rebuild, debounced by `REBUILD_DELAY`.
 - Enough **accumulated incremental deltas** — `COMPACTION_DELTA_TRIPLES`
   triples inserted or graphs dropped since the last rebuild — also schedules
   one, because QLever's query performance degrades as unmerged delta triples
@@ -383,7 +396,7 @@ as if nothing had been persisted.
 
 ## Full rebuild scheduling
 
-A **structural** change (new/removed directory, `.qlever/converters.json`,
+A **structural** change (removed directory, `.qlever/converters.json`,
 `.qleverignore`) or crossing `COMPACTION_DELTA_TRIPLES` schedules a full
 rebuild according to these rules. Ordinary content changes never reach this
 path — see [Incremental updates](#incremental-updates):
@@ -394,13 +407,19 @@ path — see [Incremental updates](#incremental-updates):
   deadline. So when the system is idle, a rebuild starts at most
   `REBUILD_DELAY` seconds after the change.
 - **A rebuild is currently running** (which can take seconds, minutes, or
-  hours depending on data volume): additional qualifying changes set a
-  `change_pending` flag. Multiple changes collapse to a single queued
+  hours depending on data volume): additional qualifying changes are
+  recorded with their reason. Multiple changes collapse to a single queued
   rebuild — never more than one is queued at a time. Incremental updates to
   the still-active slot are unaffected by a compaction build running against
   the idle slot.
-- **When the current rebuild finishes** and `change_pending` is set, the
-  next rebuild starts immediately, without re-debouncing.
+- **When the current rebuild finishes** and a change was queued, the next
+  rebuild starts immediately, without re-debouncing — unless the swap just
+  made it moot: a queued *directory removal* or *compaction* is settled by
+  the reconcile sweep that runs right after every successful swap (the new
+  slot's manifest was scanned during the build, so anything removed since is
+  in it and gets dropped; and the build that just finished is itself the
+  compaction), so those alone don't buy a second full build. Queued
+  `converters.json`/`.qleverignore` edits still do.
 - **When a rebuild fails** (the build itself, or the new slot never becoming
   healthy): the active slot keeps serving unchanged, and another rebuild is
   scheduled `REBUILD_DELAY` seconds later — no filesystem event is needed to
