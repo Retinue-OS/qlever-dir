@@ -918,10 +918,12 @@ def classify_watch_event(path: str, flags: str, converter_exts: set[str]) -> str
         (never indexed — build_index.sh and scan_source_files() skip .git —
         but every commit creates .git/objects/<xx>/ directories, which used
         to set off a full rebuild per commit)
-      - native RDF extension (.nt/.ttl/.n3)              -> "rdf-extension"
       - a directory created or moved in                   -> "dir-created"
       - a directory removed or moved away                 -> "dir-removed"
       - any other directory event (ISDIR in flags)        -> "isdir"
+        (checked before the extension, so a directory named foo.ttl/ is
+        still treated as a directory, not as one file)
+      - native RDF extension (.nt/.ttl/.n3)              -> "rdf-extension"
       - the file is a .qlever/converters.json itself       -> "converters-json"
         (build_index.sh's find excludes */.qlever/* from the index scan, so
         this file's own content is never indexed — but it can WIDEN the set
@@ -936,8 +938,6 @@ def classify_watch_event(path: str, flags: str, converter_exts: set[str]) -> str
     """
     if ".git" in Path(path).parts:
         return None
-    if path.endswith((".nt", ".ttl", ".n3")):
-        return "rdf-extension"
     if "ISDIR" in flags:
         events = set(flags.split(","))
         if events & {"CREATE", "MOVED_TO"}:
@@ -945,6 +945,8 @@ def classify_watch_event(path: str, flags: str, converter_exts: set[str]) -> str
         if events & {"DELETE", "MOVED_FROM"}:
             return "dir-removed"
         return "isdir"
+    if path.endswith((".nt", ".ttl", ".n3")):
+        return "rdf-extension"
     if os.path.basename(path) == "converters.json" and "/.qlever/" in path:
         return "converters-json"
     if os.path.basename(path) == ".qleverignore":
@@ -1135,6 +1137,8 @@ def main():
         if subtree_is_structural(dirpath):
             schedule_rebuild("dir-created with converters.json/.qleverignore")
             return
+        if {".git", ".qlever"} & set(Path(os.path.relpath(dirpath, DATA_ROOT)).parts):
+            return  # never indexed (build_index.sh: -not -path '*/.qlever/*')
         files = scan_source_files(DATA_ROOT, start=dirpath)
         if not files:
             return
@@ -1376,6 +1380,15 @@ def main():
                 # new slot never became healthy.
                 build_failed = active_slot == prev_slot
 
+                # Only reasons queued BEFORE the reconcile below starts can be
+                # settled by it: a directory removed while the sweep is
+                # already past its manifest entries would be missed. Reasons
+                # arriving from here on land in a fresh set and keep their
+                # rebuild.
+                with state_lock:
+                    queued_reasons = set(pending_rebuild_reasons)
+                    pending_rebuild_reasons.clear()
+
                 if active_slot != prev_slot:
                     # A swap actually happened (as opposed to do_rebuild
                     # aborting and returning the slot unchanged): this is a
@@ -1392,18 +1405,21 @@ def main():
                     if RECONCILE_INTERVAL > 0:
                         next_reconcile_at = time.time() + RECONCILE_INTERVAL
 
+                settled = set()
+                if not build_failed:
+                    settled = queued_reasons & RECONCILE_COVERED_REASONS
+                    queued_reasons -= settled
+
                 with state_lock:
-                    if pending_rebuild_reasons and not build_failed:
-                        settled = pending_rebuild_reasons & RECONCILE_COVERED_REASONS
-                        if settled and not pending_rebuild_reasons - settled:
-                            log(f"Queued rebuild ({', '.join(sorted(settled))}) already "
-                                f"settled by the swap and reconcile — not rebuilding again")
-                            pending_rebuild_reasons.clear()
-                    if pending_rebuild_reasons:
-                        log(f"Queued change pending ({', '.join(sorted(pending_rebuild_reasons))}) "
+                    queued_reasons |= pending_rebuild_reasons
+                    pending_rebuild_reasons.clear()
+                    if queued_reasons:
+                        log(f"Queued change pending ({', '.join(sorted(queued_reasons))}) "
                             f"— starting next rebuild immediately")
-                        pending_rebuild_reasons.clear()
                         continue
+                    if settled:
+                        log(f"Queued rebuild ({', '.join(sorted(settled))}) already "
+                            f"settled by the swap and reconcile — not rebuilding again")
                     state = "IDLE"
                     log("Rebuild failed — back to IDLE" if build_failed
                         else "Rebuild complete — back to IDLE")
