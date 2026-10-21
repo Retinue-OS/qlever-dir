@@ -1,4 +1,7 @@
-FROM docker.io/adfreiburg/qlever:latest
+# Pinned to a QLever release, by tag and digest. This project's version
+# follows it (see "Versioning" in README.md), and
+# .github/workflows/check-qlever-image.yml opens a PR for each new release.
+FROM docker.io/adfreiburg/qlever:0.6.0@sha256:37d5ede193f1bffb6aebf734d15d2a4c2a3228ee102858b0c6c2e65c149a78ec
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
