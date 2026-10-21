@@ -20,6 +20,8 @@ concurrency:
 
 jobs:
   release:
+    # A manual run can pick any branch; releases are only cut from main.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -46,7 +48,7 @@ jobs:
           elif [ "$EVENT" = "push" ]; then
             # Other Dockerfile changes on a released pin ship as a fix
             # release, published by hand.
-            echo "v${QLEVER} already exists; run this workflow by hand for a fix release"
+            echo "::notice::v${QLEVER} already exists; run this workflow by hand to publish a fix release"
             exit 0
           else
             # Next fix release on the current pin: vX.Y.Z.N+1

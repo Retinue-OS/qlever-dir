@@ -60,10 +60,17 @@ jobs:
           fi
           # Not every QLever release gets a Docker tag, and one that does may
           # lag the GitHub release; a later run picks it up.
-          DIGEST=$(curl -fsSL "https://hub.docker.com/v2/repositories/adfreiburg/qlever/tags/${LATEST}" | jq -r '.digest // empty' || true)
+          TAG_JSON=$(curl -fsSL "https://hub.docker.com/v2/repositories/adfreiburg/qlever/tags/${LATEST}" || true)
+          DIGEST=$(echo "$TAG_JSON" | jq -r '.digest // empty' 2>/dev/null || true)
           if ! echo "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$'; then
             echo "needs_update=false" >> "$GITHUB_OUTPUT"
             echo "QLever $LATEST is released, but adfreiburg/qlever:$LATEST is not on Docker Hub yet"
+            exit 0
+          fi
+          # The digest is the multi-arch index; the image builds on amd64.
+          if ! echo "$TAG_JSON" | jq -e '[.images[]? | select(.os == "linux" and .architecture == "amd64")] | length > 0' >/dev/null; then
+            echo "::warning::adfreiburg/qlever:$LATEST has no linux/amd64 image; not proposing it"
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "needs_update=true" >> "$GITHUB_OUTPUT"
@@ -80,9 +87,10 @@ jobs:
         run: |
           BRANCH="bump/qlever-${LATEST}"
 
-          # Skip if a PR for this version already exists
-          if [ "$(gh pr list --head "$BRANCH" --json number --jq 'length')" -gt 0 ]; then
-            echo "PR already exists for $BRANCH, skipping"
+          # Skip if a PR for this version exists, open or closed: closing a
+          # bump PR unmerged means "skip this version".
+          if [ "$(gh pr list --state all --head "$BRANCH" --json number --jq 'length')" -gt 0 ]; then
+            echo "::notice::A PR for $BRANCH already exists (open or closed), skipping"
             exit 0
           fi
 
