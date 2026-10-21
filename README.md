@@ -449,6 +449,10 @@ release (`adfreiburg/qlever:X.Y.Z`, pinned by digest in the `Dockerfile`).
 Only when qlever-dir itself needs a fix while QLever has not released
 again does a fourth component appear: `vX.Y.Z.1`, `vX.Y.Z.2`, …
 
+Every release ships an image, `ghcr.io/retinue-os/qlever-dir:X.Y.Z[.N]`
+(linux/amd64 and linux/arm64), so a deployment can pull it instead of
+building this repository; pin it by digest, which each release's notes give.
+
 Two workflows keep this in step:
 
 - `.github/workflows/check-qlever-image.yml` runs daily. When QLever
@@ -456,8 +460,10 @@ Two workflows keep this in step:
   exists, it opens a PR that moves the pin to it.
 - `.github/workflows/release.yml` runs on every push to `main` that changes
   the `Dockerfile`. When the pinned QLever version has no qlever-dir release
-  yet, it publishes the matching `vX.Y.Z`. Run it by hand
-  (`workflow_dispatch`) to publish the next `vX.Y.Z.N` fix release.
+  yet, it builds and pushes the image and publishes the matching `vX.Y.Z`.
+  Run it by hand (`workflow_dispatch`) to publish the next `vX.Y.Z.N` fix
+  release, or with `existing_tag` to publish the image for a release that
+  has none yet.
 
 ## Files in this project
 
