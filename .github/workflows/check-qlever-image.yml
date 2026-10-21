@@ -1,0 +1,106 @@
+name: Check QLever image
+
+# The Dockerfile pins adfreiburg/qlever by tag and digest. Upstream publishes a
+# commit-<sha> tag for every build and moves `latest` along with it; when
+# `latest` points at a build other than the pinned one, open a PR to bump.
+
+on:
+  schedule:
+    # Every Monday at 08:00 UTC
+    - cron: "0 8 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get pinned build
+        id: pinned
+        run: |
+          TAG=$(grep -oP '^FROM docker\.io/adfreiburg/qlever:\K[^@[:space:]]+' Dockerfile)
+          if ! echo "$TAG" | grep -qE '^commit-[0-9a-f]+$'; then
+            echo "Could not read the pinned tag from Dockerfile: '$TAG'" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Pinned: $TAG"
+
+      - name: Get latest build
+        id: latest
+        run: |
+          API=https://hub.docker.com/v2/repositories/adfreiburg/qlever/tags
+          DIGEST=$(curl -fsSL "$API/latest" | jq -r '.digest')
+          if ! echo "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "Unexpected digest for latest: '$DIGEST'" >&2
+            exit 1
+          fi
+          # `latest` carries no commit, so find the commit-* tag that shares
+          # its digest among the most recently pushed tags.
+          TAG=$(curl -fsSL "$API?page_size=100&ordering=last_updated" \
+            | jq -r --arg d "$DIGEST" \
+                '[.results[] | select(.digest == $d and (.name | startswith("commit-")))][0].name // empty')
+          if ! echo "$TAG" | grep -qE '^commit-[0-9a-f]+$'; then
+            echo "No commit-* tag found for latest ($DIGEST)" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Latest: $TAG ($DIGEST)"
+
+      - name: Create bump PR
+        if: steps.pinned.outputs.tag != steps.latest.outputs.tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PINNED: ${{ steps.pinned.outputs.tag }}
+          LATEST: ${{ steps.latest.outputs.tag }}
+          DIGEST: ${{ steps.latest.outputs.digest }}
+        run: |
+          BRANCH="bump/qlever-${LATEST}"
+
+          # Skip if a PR for this build already exists
+          if [ "$(gh pr list --head "$BRANCH" --json number --jq 'length')" -gt 0 ]; then
+            echo "PR already exists for $BRANCH, skipping"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$BRANCH"
+          sed -i -E "s|^FROM docker\.io/adfreiburg/qlever:[^[:space:]]+|FROM docker.io/adfreiburg/qlever:${LATEST}@${DIGEST}|" Dockerfile
+          git add Dockerfile
+          git commit -m "chore: bump QLever image from ${PINNED} to ${LATEST}"
+          git push origin "$BRANCH"
+
+          OLD_SHA=${PINNED#commit-}
+          NEW_SHA=${LATEST#commit-}
+          BODY=$(cat <<EOF
+          Automated bump found by the weekly QLever image check.
+
+          - **Previous build:** \`${PINNED}\`
+          - **New build:** \`${LATEST}\` (\`${DIGEST}\`)
+          - **Upstream changes:** https://github.com/ad-freiburg/qlever/compare/${OLD_SHA}...${NEW_SHA}
+
+          Before merging, build the image and check that a query through nginx on
+          port 7001 returns one well-formed JSON document.
+          EOF
+          )
+          NEW_PR=$(gh pr create \
+            --title "chore: bump QLever image from ${PINNED} to ${LATEST}" \
+            --body "$BODY" \
+            --base main \
+            --head "$BRANCH")
+
+          # Close older bump PRs this one supersedes
+          gh pr list --state open --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"bump/qlever-\")) | select(.headRefName != \"$BRANCH\") | .number" \
+            | while read -r N; do
+                gh pr close "$N" --delete-branch --comment "Superseded by $NEW_PR."
+              done

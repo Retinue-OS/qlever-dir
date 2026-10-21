@@ -1,4 +1,7 @@
-FROM docker.io/adfreiburg/qlever:latest
+# Pinned by tag and digest: `latest` is rebuilt on every QLever commit, so an
+# unpinned base changes under a rebuild. .github/workflows/check-qlever-image.yml
+# opens a PR when a newer build is published.
+FROM docker.io/adfreiburg/qlever:commit-831744889d@sha256:3ee963c632eca979f708e5e93aa8fc6ca3c7f3dfcc0078774c4f78f3ad620e56
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1

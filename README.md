@@ -444,8 +444,9 @@ implemented).
 
 ## Files in this project
 
-- `Dockerfile` — based on `adfreiburg/qlever:latest`, adds nginx, inotify-tools,
-  rapper, Python.
+- `Dockerfile` — based on a pinned `adfreiburg/qlever` build (tag and digest;
+  a weekly workflow opens a PR when a newer one is published), adds nginx,
+  inotify-tools, rapper, Python.
 - `orchestrator.py` — entrypoint. Manages the inotify watcher, the
   incremental SPARQL Update path, the full-rebuild/compaction state machine,
   blue-green swap, the reconciliation sweep, and nginx reloads.
