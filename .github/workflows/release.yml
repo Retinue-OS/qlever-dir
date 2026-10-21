@@ -5,18 +5,32 @@ name: Release
 #   vX.Y.Z, matching that QLever release;
 # - a manual run on a pin that already has vX.Y.Z publishes the next fix
 #   release vX.Y.Z.N.
+# Every release ships the image ghcr.io/retinue-os/qlever-dir:X.Y.Z[.N],
+# built and pushed here before the release is created. Releases made with
+# GITHUB_TOKEN start no other workflow, so publishing cannot live elsewhere.
 
 on:
   push:
     branches: [main]
     paths: [Dockerfile]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      existing_tag:
+        description: >-
+          Publish the image for this existing release (e.g. v0.6.0) instead
+          of cutting a new one
+        required: false
+        default: ""
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: release
+
+env:
+  IMAGE: ghcr.io/retinue-os/qlever-dir
 
 jobs:
   release:
@@ -33,50 +47,126 @@ jobs:
         id: version
         env:
           EVENT: ${{ github.event_name }}
+          EXISTING_TAG: ${{ inputs.existing_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           pin() {
             grep -oP '^FROM docker\.io/adfreiburg/qlever:\K[0-9]+(\.[0-9]+)+(?=@)' || true
           }
-          QLEVER=$(pin < Dockerfile)
-          if [ -z "$QLEVER" ]; then
-            echo "Could not read the pinned QLever version from Dockerfile" >&2
-            exit 1
-          fi
 
-          if ! git rev-parse -q --verify "refs/tags/v${QLEVER}" >/dev/null; then
-            TAG="v${QLEVER}"
-          elif [ "$EVENT" = "push" ]; then
-            # Other Dockerfile changes on a released pin ship as a fix
-            # release, published by hand.
-            echo "::notice::v${QLEVER} already exists; run this workflow by hand to publish a fix release"
-            exit 0
-          else
-            # Next fix release on the current pin: vX.Y.Z.N+1
-            LAST=$(git tag --list "v${QLEVER}.*" \
-              | grep -E "^v${QLEVER//./\\.}\.[0-9]+$" \
-              | sed "s/^v${QLEVER//./\\.}\.//" | sort -n | tail -1)
-            TAG="v${QLEVER}.$(( ${LAST:-0} + 1 ))"
-            if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-              echo "$TAG already exists; nothing to release" >&2
+          if [ -n "$EXISTING_TAG" ]; then
+            # vX.Y.Z or vX.Y.Z.N, the only forms this workflow releases
+            if ! echo "$EXISTING_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+              echo "existing_tag must look like vX.Y.Z or vX.Y.Z.N, not '$EXISTING_TAG'" >&2
               exit 1
             fi
+            if ! git rev-parse -q --verify "refs/tags/${EXISTING_TAG}" >/dev/null \
+                || ! gh release view "$EXISTING_TAG" >/dev/null 2>&1; then
+              echo "No release $EXISTING_TAG (both the tag and the GitHub release must exist)" >&2
+              exit 1
+            fi
+            git checkout -q "$EXISTING_TAG"
+            TAG="$EXISTING_TAG"
+            QLEVER=$(pin < Dockerfile)
+            echo "existing=true" >> "$GITHUB_OUTPUT"
+          else
+            QLEVER=$(pin < Dockerfile)
+            if [ -z "$QLEVER" ]; then
+              echo "Could not read the pinned QLever version from Dockerfile" >&2
+              exit 1
+            fi
+
+            if ! git rev-parse -q --verify "refs/tags/v${QLEVER}" >/dev/null; then
+              TAG="v${QLEVER}"
+            elif [ "$EVENT" = "push" ]; then
+              # Other Dockerfile changes on a released pin ship as a fix
+              # release, published by hand.
+              echo "::notice::v${QLEVER} already exists; run this workflow by hand to publish a fix release"
+              exit 0
+            else
+              # Next fix release on the current pin: vX.Y.Z.N+1
+              LAST=$(git tag --list "v${QLEVER}.*" \
+                | grep -E "^v${QLEVER//./\\.}\.[0-9]+$" \
+                | sed "s/^v${QLEVER//./\\.}\.//" | sort -n | tail -1)
+              TAG="v${QLEVER}.$(( ${LAST:-0} + 1 ))"
+              if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+                echo "$TAG already exists; nothing to release" >&2
+                exit 1
+              fi
+            fi
+            echo "existing=false" >> "$GITHUB_OUTPUT"
           fi
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
           echo "qlever=$QLEVER" >> "$GITHUB_OUTPUT"
-          echo "Releasing $TAG on QLever $QLEVER"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG on QLever ${QLEVER:-unknown}"
+
+      - name: Set up QEMU
+        if: steps.version.outputs.tag != ''
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        if: steps.version.outputs.tag != ''
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: steps.version.outputs.tag != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: image
+        if: steps.version.outputs.tag != ''
+        uses: docker/build-push-action@v6
+        with:
+          # The checked-out tree (the release tag when publishing an
+          # existing release), not the triggering commit from git context.
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.version.outputs.sha }}
+            org.opencontainers.image.licenses=MIT
 
       - name: Publish release
-        if: steps.version.outputs.tag != ''
+        if: steps.version.outputs.tag != '' && steps.version.outputs.existing != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
           QLEVER: ${{ steps.version.outputs.qlever }}
+          DIGEST: ${{ steps.image.outputs.digest }}
         run: |
-          NOTES=$(printf 'Built on QLever %s (`adfreiburg/qlever:%s`): https://github.com/ad-freiburg/qlever/releases/tag/v%s' \
-            "$QLEVER" "$QLEVER" "$QLEVER")
+          NOTES=$(printf 'Image: `%s:%s@%s`\n\nBuilt on QLever %s (`adfreiburg/qlever:%s`): https://github.com/ad-freiburg/qlever/releases/tag/v%s' \
+            "$IMAGE" "$VERSION" "$DIGEST" "$QLEVER" "$QLEVER" "$QLEVER")
           gh release create "$TAG" \
             --target "$GITHUB_SHA" \
             --title "$TAG" \
             --notes "$NOTES" \
             --generate-notes
+
+      - name: Add the image to an existing release
+        if: steps.version.outputs.existing == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          # Idempotent on a retry: drop any image line a previous run added
+          # (with the blank line after it), then put the current one first.
+          gh release view "$TAG" --json body --jq '.body' \
+            | awk -v prefix="Image: \`${IMAGE}:" '
+                skip && $0 == "" { skip = 0; next }
+                index($0, prefix) == 1 { skip = 1; next }
+                { skip = 0; print }' > body.md
+          { printf 'Image: `%s:%s@%s`\n\n' "$IMAGE" "$VERSION" "$DIGEST"; cat body.md; } > notes.md
+          gh release edit "$TAG" --notes-file notes.md
