@@ -1,7 +1,7 @@
-# Pinned by tag and digest: `latest` is rebuilt on every QLever commit, so an
-# unpinned base changes under a rebuild. .github/workflows/check-qlever-image.yml
-# opens a PR when a newer build is published.
-FROM docker.io/adfreiburg/qlever:commit-831744889d@sha256:3ee963c632eca979f708e5e93aa8fc6ca3c7f3dfcc0078774c4f78f3ad620e56
+# Pinned to a QLever release, by tag and digest. This project's version
+# follows it (see "Versioning" in README.md), and
+# .github/workflows/check-qlever-image.yml opens a PR for each new release.
+FROM docker.io/adfreiburg/qlever:0.6.0@sha256:37d5ede193f1bffb6aebf734d15d2a4c2a3228ee102858b0c6c2e65c149a78ec
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1

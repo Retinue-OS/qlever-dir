@@ -1,13 +1,14 @@
-name: Check QLever image
+name: Check QLever release
 
-# The Dockerfile pins adfreiburg/qlever by tag and digest. Upstream publishes a
-# commit-<sha> tag for every build and moves `latest` along with it; when
-# `latest` points at a build other than the pinned one, open a PR to bump.
+# The Dockerfile pins adfreiburg/qlever to a QLever release, by tag and
+# digest. When QLever publishes a newer release and its Docker image exists,
+# open a PR that moves the pin; merging it publishes the matching qlever-dir
+# release (see release.yml and "Versioning" in README.md).
 
 on:
   schedule:
-    # Every Monday at 08:00 UTC
-    - cron: "0 8 * * 1"
+    # Daily at 08:00 UTC
+    - cron: "0 8 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -21,50 +22,65 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Get pinned build
+      - name: Get pinned version
         id: pinned
         run: |
-          TAG=$(grep -oP '^FROM docker\.io/adfreiburg/qlever:\K[^@[:space:]]+' Dockerfile)
-          if ! echo "$TAG" | grep -qE '^commit-[0-9a-f]+$'; then
-            echo "Could not read the pinned tag from Dockerfile: '$TAG'" >&2
+          VERSION=$(grep -oP '^FROM docker\.io/adfreiburg/qlever:\K[0-9]+(\.[0-9]+)+(?=@)' Dockerfile)
+          if [ -z "$VERSION" ]; then
+            echo "Could not read the pinned QLever version from Dockerfile" >&2
             exit 1
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Pinned: $TAG"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Pinned version: $VERSION"
 
-      - name: Get latest build
+      - name: Get latest release
         id: latest
-        run: |
-          API=https://hub.docker.com/v2/repositories/adfreiburg/qlever/tags
-          DIGEST=$(curl -fsSL "$API/latest" | jq -r '.digest')
-          if ! echo "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$'; then
-            echo "Unexpected digest for latest: '$DIGEST'" >&2
-            exit 1
-          fi
-          # `latest` carries no commit, so find the commit-* tag that shares
-          # its digest among the most recently pushed tags.
-          TAG=$(curl -fsSL "$API?page_size=100&ordering=last_updated" \
-            | jq -r --arg d "$DIGEST" \
-                '[.results[] | select(.digest == $d and (.name | startswith("commit-")))][0].name // empty')
-          if ! echo "$TAG" | grep -qE '^commit-[0-9a-f]+$'; then
-            echo "No commit-* tag found for latest ($DIGEST)" >&2
-            exit 1
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          echo "Latest: $TAG ($DIGEST)"
-
-      - name: Create bump PR
-        if: steps.pinned.outputs.tag != steps.latest.outputs.tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PINNED: ${{ steps.pinned.outputs.tag }}
-          LATEST: ${{ steps.latest.outputs.tag }}
-          DIGEST: ${{ steps.latest.outputs.digest }}
+        run: |
+          # releases/latest skips pre-releases such as latest-master
+          LATEST=$(gh api repos/ad-freiburg/qlever/releases/latest --jq '.tag_name' | sed 's/^v//')
+          if ! echo "$LATEST" | grep -qE '^[0-9]+(\.[0-9]+)+$'; then
+            echo "Unexpected version format from API: $LATEST" >&2
+            exit 1
+          fi
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest version: $LATEST"
+
+      - name: Compare versions
+        id: compare
+        env:
+          PINNED: ${{ steps.pinned.outputs.version }}
+          LATEST: ${{ steps.latest.outputs.version }}
+        run: |
+          if [ "$PINNED" = "$LATEST" ] || [ "$(printf '%s\n' "$PINNED" "$LATEST" | sort -V | tail -1)" != "$LATEST" ]; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date ($PINNED)"
+            exit 0
+          fi
+          # Not every QLever release gets a Docker tag, and one that does may
+          # lag the GitHub release; a later run picks it up.
+          DIGEST=$(curl -fsSL "https://hub.docker.com/v2/repositories/adfreiburg/qlever/tags/${LATEST}" | jq -r '.digest // empty' || true)
+          if ! echo "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "QLever $LATEST is released, but adfreiburg/qlever:$LATEST is not on Docker Hub yet"
+            exit 0
+          fi
+          echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "New version available: $LATEST ($DIGEST, pinned: $PINNED)"
+
+      - name: Create bump PR
+        if: steps.compare.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PINNED: ${{ steps.pinned.outputs.version }}
+          LATEST: ${{ steps.latest.outputs.version }}
+          DIGEST: ${{ steps.compare.outputs.digest }}
         run: |
           BRANCH="bump/qlever-${LATEST}"
 
-          # Skip if a PR for this build already exists
+          # Skip if a PR for this version already exists
           if [ "$(gh pr list --head "$BRANCH" --json number --jq 'length')" -gt 0 ]; then
             echo "PR already exists for $BRANCH, skipping"
             exit 0
@@ -76,24 +92,23 @@ jobs:
           git checkout -b "$BRANCH"
           sed -i -E "s|^FROM docker\.io/adfreiburg/qlever:[^[:space:]]+|FROM docker.io/adfreiburg/qlever:${LATEST}@${DIGEST}|" Dockerfile
           git add Dockerfile
-          git commit -m "chore: bump QLever image from ${PINNED} to ${LATEST}"
+          git commit -m "chore: bump QLever from ${PINNED} to ${LATEST}"
           git push origin "$BRANCH"
 
-          OLD_SHA=${PINNED#commit-}
-          NEW_SHA=${LATEST#commit-}
           BODY=$(cat <<EOF
-          Automated bump found by the weekly QLever image check.
+          Automated bump found by the daily QLever release check.
 
-          - **Previous build:** \`${PINNED}\`
-          - **New build:** \`${LATEST}\` (\`${DIGEST}\`)
-          - **Upstream changes:** https://github.com/ad-freiburg/qlever/compare/${OLD_SHA}...${NEW_SHA}
+          - **Previous version:** ${PINNED}
+          - **New version:** ${LATEST} (\`adfreiburg/qlever:${LATEST}@${DIGEST}\`)
+          - **Release notes:** https://github.com/ad-freiburg/qlever/releases/tag/v${LATEST}
 
-          Before merging, build the image and check that a query through nginx on
-          port 7001 returns one well-formed JSON document.
+          Merging publishes qlever-dir v${LATEST}. Before merging, build the image
+          and check that indexing, incremental updates and a query through nginx
+          on port 7001 work.
           EOF
           )
           NEW_PR=$(gh pr create \
-            --title "chore: bump QLever image from ${PINNED} to ${LATEST}" \
+            --title "chore: bump QLever from ${PINNED} to ${LATEST}" \
             --body "$BODY" \
             --base main \
             --head "$BRANCH")

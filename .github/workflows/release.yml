@@ -1,0 +1,82 @@
+name: Release
+
+# qlever-dir versions follow QLever's (see "Versioning" in README.md):
+# - a push to main that moves the pin from one QLever release to another
+#   publishes vX.Y.Z, matching the new QLever release;
+# - a manual run publishes the next fix release vX.Y.Z.N on the current pin.
+
+on:
+  push:
+    branches: [main]
+    paths: [Dockerfile]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide the version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          pin() {
+            grep -oP '^FROM docker\.io/adfreiburg/qlever:\K[0-9]+(\.[0-9]+)+(?=@)' || true
+          }
+          QLEVER=$(pin < Dockerfile)
+          if [ -z "$QLEVER" ]; then
+            echo "Could not read the pinned QLever version from Dockerfile" >&2
+            exit 1
+          fi
+
+          if [ "$EVENT" = "push" ]; then
+            PREVIOUS=$(git show "${BEFORE}:Dockerfile" 2>/dev/null | pin)
+            # Only a move from one release to another mirrors QLever. Any
+            # other Dockerfile change (or the first pin) is released by hand.
+            if [ -z "$PREVIOUS" ] || [ "$PREVIOUS" = "$QLEVER" ]; then
+              echo "Pin did not move between QLever releases (${PREVIOUS:-none} -> $QLEVER); nothing to release"
+              exit 0
+            fi
+            TAG="v${QLEVER}"
+          else
+            # Next fix release on the current pin: vX.Y.Z.N+1
+            LAST=$(git tag --list "v${QLEVER}.*" \
+              | grep -E "^v${QLEVER//./\\.}\.[0-9]+$" \
+              | sed "s/^v${QLEVER//./\\.}\.//" | sort -n | tail -1)
+            TAG="v${QLEVER}.$(( ${LAST:-0} + 1 ))"
+          fi
+
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "$TAG already exists; nothing to release"
+            exit 0
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "qlever=$QLEVER" >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG on QLever $QLEVER"
+
+      - name: Publish release
+        if: steps.version.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          QLEVER: ${{ steps.version.outputs.qlever }}
+        run: |
+          NOTES=$(printf 'Built on QLever %s (`adfreiburg/qlever:%s`): https://github.com/ad-freiburg/qlever/releases/tag/v%s' \
+            "$QLEVER" "$QLEVER" "$QLEVER")
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "$NOTES" \
+            --generate-notes
