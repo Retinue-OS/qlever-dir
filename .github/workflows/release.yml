@@ -1,9 +1,10 @@
 name: Release
 
 # qlever-dir versions follow QLever's (see "Versioning" in README.md):
-# - a push to main that moves the pin from one QLever release to another
-#   publishes vX.Y.Z, matching the new QLever release;
-# - a manual run publishes the next fix release vX.Y.Z.N on the current pin.
+# - a push to main that pins a QLever release with no vX.Y.Z yet publishes
+#   vX.Y.Z, matching that QLever release;
+# - a manual run on a pin that already has vX.Y.Z publishes the next fix
+#   release vX.Y.Z.N.
 
 on:
   push:
@@ -30,7 +31,6 @@ jobs:
         id: version
         env:
           EVENT: ${{ github.event_name }}
-          BEFORE: ${{ github.event.before }}
         run: |
           pin() {
             grep -oP '^FROM docker\.io/adfreiburg/qlever:\K[0-9]+(\.[0-9]+)+(?=@)' || true
@@ -41,27 +41,25 @@ jobs:
             exit 1
           fi
 
-          if [ "$EVENT" = "push" ]; then
-            PREVIOUS=$(git show "${BEFORE}:Dockerfile" 2>/dev/null | pin)
-            # Only a move from one release to another mirrors QLever. Any
-            # other Dockerfile change (or the first pin) is released by hand.
-            if [ -z "$PREVIOUS" ] || [ "$PREVIOUS" = "$QLEVER" ]; then
-              echo "Pin did not move between QLever releases (${PREVIOUS:-none} -> $QLEVER); nothing to release"
-              exit 0
-            fi
+          if ! git rev-parse -q --verify "refs/tags/v${QLEVER}" >/dev/null; then
             TAG="v${QLEVER}"
+          elif [ "$EVENT" = "push" ]; then
+            # Other Dockerfile changes on a released pin ship as a fix
+            # release, published by hand.
+            echo "v${QLEVER} already exists; run this workflow by hand for a fix release"
+            exit 0
           else
             # Next fix release on the current pin: vX.Y.Z.N+1
             LAST=$(git tag --list "v${QLEVER}.*" \
               | grep -E "^v${QLEVER//./\\.}\.[0-9]+$" \
               | sed "s/^v${QLEVER//./\\.}\.//" | sort -n | tail -1)
             TAG="v${QLEVER}.$(( ${LAST:-0} + 1 ))"
+            if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+              echo "$TAG already exists; nothing to release" >&2
+              exit 1
+            fi
           fi
 
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "$TAG already exists; nothing to release"
-            exit 0
-          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "qlever=$QLEVER" >> "$GITHUB_OUTPUT"
           echo "Releasing $TAG on QLever $QLEVER"

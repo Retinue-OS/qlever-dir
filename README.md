@@ -446,8 +446,8 @@ implemented).
 
 Releases follow QLever's: qlever-dir `vX.Y.Z` is built on the QLever `X.Y.Z`
 release (`adfreiburg/qlever:X.Y.Z`, pinned by digest in the `Dockerfile`).
-Fixes to qlever-dir itself between two QLever releases add a fourth
-component: `vX.Y.Z.1`, `vX.Y.Z.2`, …
+Only when qlever-dir itself needs a fix while QLever has not released
+again does a fourth component appear: `vX.Y.Z.1`, `vX.Y.Z.2`, …
 
 Two workflows keep this in step:
 
@@ -455,8 +455,8 @@ Two workflows keep this in step:
   publishes a release that is newer than the pin and its Docker image
   exists, it opens a PR that moves the pin to it.
 - `.github/workflows/release.yml` runs on every push to `main` that changes
-  the `Dockerfile`. When the pin moved from one QLever release to another,
-  it publishes the matching `vX.Y.Z` release. Run it by hand
+  the `Dockerfile`. When the pinned QLever version has no qlever-dir release
+  yet, it publishes the matching `vX.Y.Z`. Run it by hand
   (`workflow_dispatch`) to publish the next `vX.Y.Z.N` fix release.
 
 ## Files in this project
