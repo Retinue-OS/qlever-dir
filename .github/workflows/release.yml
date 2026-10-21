@@ -48,15 +48,21 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           EXISTING_TAG: ${{ inputs.existing_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           pin() {
             grep -oP '^FROM docker\.io/adfreiburg/qlever:\K[0-9]+(\.[0-9]+)+(?=@)' || true
           }
 
           if [ -n "$EXISTING_TAG" ]; then
-            if ! echo "$EXISTING_TAG" | grep -qE '^v[0-9]+(\.[0-9]+)+$' \
-                || ! git rev-parse -q --verify "refs/tags/${EXISTING_TAG}" >/dev/null; then
-              echo "No release tag $EXISTING_TAG" >&2
+            # vX.Y.Z or vX.Y.Z.N, the only forms this workflow releases
+            if ! echo "$EXISTING_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+              echo "existing_tag must look like vX.Y.Z or vX.Y.Z.N, not '$EXISTING_TAG'" >&2
+              exit 1
+            fi
+            if ! git rev-parse -q --verify "refs/tags/${EXISTING_TAG}" >/dev/null \
+                || ! gh release view "$EXISTING_TAG" >/dev/null 2>&1; then
+              echo "No release $EXISTING_TAG (both the tag and the GitHub release must exist)" >&2
               exit 1
             fi
             git checkout -q "$EXISTING_TAG"
@@ -155,6 +161,12 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           DIGEST: ${{ steps.image.outputs.digest }}
         run: |
-          BODY=$(gh release view "$TAG" --json body --jq '.body')
-          printf 'Image: `%s:%s@%s`\n\n%s' "$IMAGE" "$VERSION" "$DIGEST" "$BODY" > notes.md
+          # Idempotent on a retry: drop any image line a previous run added
+          # (with the blank line after it), then put the current one first.
+          gh release view "$TAG" --json body --jq '.body' \
+            | awk -v prefix="Image: \`${IMAGE}:" '
+                skip && $0 == "" { skip = 0; next }
+                index($0, prefix) == 1 { skip = 1; next }
+                { skip = 0; print }' > body.md
+          { printf 'Image: `%s:%s@%s`\n\n' "$IMAGE" "$VERSION" "$DIGEST"; cat body.md; } > notes.md
           gh release edit "$TAG" --notes-file notes.md
